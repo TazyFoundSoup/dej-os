@@ -16,18 +16,15 @@ void ap_entry(struct limine_mp_info *cpu)
             atomic_store(&temperature, random % 131);
         }
 
-
-
-        if (cpu_running == false){
-            __asm__ volatile ("cli");
-            while (true){
-                __asm__ volatile ("hlt");
-            }
+        if (atomic_load(&cpu_running) == true) {
+          __asm__ volatile("cli");
+          while (true) {
+            __asm__ volatile("hlt");
+          }
         }
-
 
         __asm__ volatile ("pause");
         __asm__ volatile ("pause"); // chill bro
     }
 
-}
+}       // inside my kernel that i made lol
