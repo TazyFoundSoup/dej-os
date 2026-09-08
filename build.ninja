@@ -1,0 +1,66 @@
+builddir = build
+
+kernel_dir = src/kernel
+limine_dir = Limine
+limine = $limine_dir/bin/limine
+
+kernel = $builddir/kernel.elf
+image = $builddir/dej-os.img
+mnt = $builddir/mnt
+
+cc = gcc
+ccflags = -ffreestanding -fno-stack-protector -fno-pie -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-builtin -fno-omit-frame-pointer -mno-red-zone -m64 -mcmodel=kernel -std=c11 -Wall -Werror -g -mrdrnd
+
+asm = nasm
+ld = ld.lld
+
+rule cc
+    command = $cc $ccflags -c $in -o $out
+    description = CC $out
+
+rule asm
+    command = $asm -f elf64 $in -o $out
+    description = ASM $out
+
+rule link
+    command = $ld -T $kernel_dir/linker.ld -o $out $in
+    description = LD $out
+
+rule limine
+    command = cd $limine_dir && make
+    description = LIMINE
+
+rule image
+    command = rm -f $out && dd if=/dev/zero of=$out bs=1M count=64 && sgdisk -Z $out && sgdisk -n 1:2048:4095 -t 1:ef02 $out && sgdisk -n 2:4096:0 -t 2:ef00 $out && sudo losetup --find --partscan --show $out > $builddir/loopdev && sudo partprobe $$(cat $builddir/loopdev) && sudo mkfs.fat -F 32 $$(cat $builddir/loopdev)p2 && mkdir -p $mnt && sudo mount $$(cat $builddir/loopdev)p2 $mnt && sudo mkdir -p $mnt/boot/limine && sudo cp $kernel $mnt/boot/kernel.elf && sudo cp limine.conf $mnt/limine.conf && sudo cp $limine_dir/bin/limine-bios.sys $mnt/boot/limine/limine-bios.sys && sudo umount $mnt && sudo losetup -d $$(cat $builddir/loopdev) && rm -f $builddir/loopdev && $limine bios-install $out
+    description = IMAGE $out
+
+build $builddir/main.o: cc $kernel_dir/main.c
+build $builddir/stdio.o: cc $kernel_dir/stdio.c
+build $builddir/string.o: cc $kernel_dir/string.c
+
+build $builddir/entry.o: asm $kernel_dir/entry.asm
+build $builddir/x86.o: asm $kernel_dir/x86.asm
+
+build $builddir/interrupt/interrupt.o: cc $kernel_dir/interrupt/interrupt.c
+build $builddir/interrupt/nmi.o: cc $kernel_dir/interrupt/nmi.c
+build $builddir/interrupt/interupt.o: asm $kernel_dir/interrupt/interupt.asm
+
+build $builddir/keyboard/keyboard.o: cc $kernel_dir/keyboard/keyboard.c
+
+build $builddir/memory/memory.o: cc $kernel_dir/memory/memory.c
+
+build $builddir/cpu/cpu1/temprature.o: cc $kernel_dir/cpu/cpu1/temprature.c
+
+build $builddir/x86/panic.o: cc $kernel_dir/x86/panic.c
+
+build $kernel: link $builddir/main.o $builddir/stdio.o $builddir/string.o $builddir/entry.o $builddir/x86.o $builddir/interrupt/interrupt.o $builddir/interrupt/nmi.o $builddir/interrupt/interupt.o $builddir/keyboard/keyboard.o $builddir/memory/memory.o $builddir/cpu/cpu1/temprature.o $builddir/x86/panic.o $kernel_dir/linker.ld
+
+build $builddir/limine: limine
+
+build $image: image $kernel $builddir/limine limine.conf
+
+build kernel: phony $kernel
+build image: phony $image
+build all: phony $image
+
+default all
