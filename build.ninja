@@ -1,7 +1,7 @@
 builddir = build
 
 kernel_dir = src/kernel
-limine_dir = Limine
+limine_dir = limine
 limine = $limine_dir/bin/limine
 
 kernel = $builddir/kernel.elf
