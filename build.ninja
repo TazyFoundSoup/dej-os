@@ -27,7 +27,7 @@ rule link
     description = LD $out
 
 rule limine
-    command = cd $limine_dir && make
+    command = cd $limine_dir && ./configure && make
     description = LIMINE
 
 rule image
