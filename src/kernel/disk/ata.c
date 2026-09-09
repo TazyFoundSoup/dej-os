@@ -494,11 +494,13 @@ struct file_fat32 fat_open(const char * path){
         printf("component: %s \n", component);
 
          if (findfat_file(component, &dirent, HL_CLUSTER) != 0){
-             printf("Failed to read disk at %ul", HL_CLUSTER);
+             printf("Failed to read disk at %ul \n", HL_CLUSTER);
              return ret;
          }
 
-        while (*path++ == '/') path++;
+        while (*path == '/'){
+                path++;
+        }
 
         if (*path == '\0')  return dirent2fat32file(dirent);
         if (dirent.flags != 0x10) return ret;

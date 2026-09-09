@@ -139,9 +139,9 @@ void kentry(void) {
 
     int a = ata_init();
     printf("Disk init returned %i \n", a);
-    struct file_fat32 f = fat_open("test.txt");
-    if (!f.first_cluster) printf("failed to open le file");
-    else printf("Opened file first cluster = %ul", f.first_cluster);
+    struct file_fat32 f = fat_open("boot/kernel.elf");
+    if (!f.first_cluster) printf("failed to open le file\n");
+    else printf("Opened file first cluster = %lu \n", f.first_cluster);
 
 
     // Fetch the first framebuffer.
