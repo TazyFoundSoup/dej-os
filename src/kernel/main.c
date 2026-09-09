@@ -10,7 +10,7 @@
 #include "msr.h"
 #include "cpu/cpu1/temprature.h"
 #include <stdatomic.h>
-#include "disk/disk.h"
+#include "disk/ata.h"
 
 __attribute__((section(".temperature")))
 _Atomic uint64_t temperature;
@@ -137,10 +137,11 @@ void kentry(void) {
         }
     }
 
-    int a = disk_init();
+    int a = ata_init();
     printf("Disk init returned %i \n", a);
-    a = findfat_file("test.txt");
-    printf("find file returned %i", a);
+    struct file_fat32 f = fat_open("test.txt");
+    if (!f.first_cluster) printf("failed to open le file");
+    else printf("Opened file first cluster = %ul", f.first_cluster);
 
 
     // Fetch the first framebuffer.

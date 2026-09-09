@@ -1,6 +1,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "ata.h"
 #include "../string.h"
 #include "../x86.h"
 #include "../stdio.h"
@@ -21,18 +22,13 @@
 #define ALT_STATUS 0x3F6
 //timeout
 #define ATA_TIMEOUT 67676           // haha so funny bro haha
-
+#define HL_CLUSTER (((uint32_t)dirent.high_word_first_cluster <<16) | dirent.low_word_first_cluster)
 
 typedef union {
     uint16_t raw_buffer[256];
     // probab gonna add like a struct or something
 }ata_identify_t;
 
-struct file_fat32  {
-    uint64_t lba;
-    uint64_t length;
-    uint16_t sector_count;
-};
 
 struct gpt {
   uint8_t sig[8];
@@ -139,6 +135,7 @@ _Static_assert(sizeof(struct direntry) == 32, "Dir entry incorrect size");
 static bool inited;
 static bool _48bitlba;
 static uint64_t vol_start_lba;
+static struct bpb g_bpb;
 
 
 
@@ -263,8 +260,70 @@ static int ata_read_sector(uint64_t lba, void * buffer){
         return 0;
 }
 
+struct file_fat32 dirent2fat32file(struct direntry dirent){
+    struct file_fat32 ret = {0};
 
-int disk_init(void){
+    ret.first_cluster = (((uint32_t)dirent.high_word_first_cluster <<16) | dirent.low_word_first_cluster);
+    ret.attr = dirent.flags;
+    ret.size = dirent.size;
+
+    return ret;
+}
+
+static void conv_tosfn(const char * fname, uint8_t out[]){
+    if (strlen(fname) > 11)return;
+    uint8_t fat_name[11];
+    memset(fat_name, ' ', 11);
+
+    int x = 0;
+    while (fname[x] != '.' && fname[x] != '\0' && x < 8) {
+        fat_name[x] = fat_toupper(fname[x]);
+        x++;
+    }
+
+    /* skip '.' */
+    if (fname[x] == '.')
+        x++;
+
+    /* copy extension */
+    int y = 0;
+    while (fname[x] != '\0' && y < 3) {
+        fat_name[8 + y] = fat_toupper(fname[x]);
+        x++;
+        y++;
+    }
+
+    for (int i = 0; i < 11; i++) {
+        out[i] = fat_name[i];
+    }
+}
+
+static int next_path_component(const char **path, char *component, size_t size)
+{
+    const char *p = *path;
+
+    while (*p == '/')
+        p++;
+
+    if (*p == '\0')
+        return 0;
+
+    size_t i = 0;
+
+    while (*p != '/' && *p != '\0') {
+        if (i + 1 >= size)
+            return -1;
+
+        component[i++] = *p++;
+    }
+
+    component[i] = '\0';
+    *path = p;
+
+    return 1;
+}
+
+int ata_init(void){
     uint8_t data;
     uint8_t status;
     uint32_t tries = 0;
@@ -332,6 +391,16 @@ int disk_init(void){
     vol_start_lba = part_buf.gpt_p.part2.f_lba;         // explicitly use partition 2 for my disk layout
     serial_puts("Found start of fat\n");
 
+    fat_bpb bpb;
+    if (ata_read_sector(vol_start_lba, bpb.raw) != 0){
+        serial_puts("File read failed");
+        return -1;
+    }
+
+    if (!(bpb.raw[510] == 0x55 && bpb.raw[511] == 0xAA))  return -1;
+
+    g_bpb = bpb.bp;
+
 
     inited = true;
     return 0;
@@ -342,54 +411,42 @@ timeout:
     return 100;
 }
 
-
-int findfat_file(const char * fname){
+/*
+ * find fat file
+ * 1 file name
+ * 2 output buffer
+ * 3 directory cluster (if its null then root sector)
+ *
+ * returns -1 for error
+ * 0 for good
+ */
+static int findfat_file(const char * fname, struct direntry *out, uint32_t dir_cluster){
     if (!inited) return -1;
     if (strnlen(fname, 12) == 12) return -1;
     void * cluster = givemeapage();
 
-
-
     uint8_t fat_name[11];
-    memset(fat_name, ' ', 11);
+    conv_tosfn(fname, fat_name);
+    uint64_t sector_lba;
 
-    int x = 0;
-    while (fname[x] != '.' && fname[x] != '\0' && x < 8) {
-        fat_name[x] = fat_toupper(fname[x]);
-        x++;
-    }
-
-    /* skip '.' */
-    if (fname[x] == '.')
-        x++;
-
-    /* copy extension */
-    int y = 0;
-    while (fname[x] != '\0' && y < 3) {
-        fat_name[8 + y] = fat_toupper(fname[x]);
-        x++;
-        y++;
-    }
-
-    fat_bpb bpb;
-    if (ata_read_sector(vol_start_lba, bpb.raw) != 0){
-        serial_puts("File read failed");
-        return -1;
-    }
-
-    if (bpb.raw[510] == 0x55 && bpb.raw[511] == 0xAA) printf("Got fat bpb\n");
-
-
-    uint64_t sector_lba = clustertolba48(bpb.bp.root_dir_cluster,
+    if (dir_cluster == 0)   {sector_lba = clustertolba48(g_bpb.root_dir_cluster,
                                                 vol_start_lba,
-                                                bpb.bp.reserved_sectors,
-                                                bpb.bp.num_fats,
-                                                bpb.bp.sec_per_fat,
-                                                bpb.bp.sectors_per_cluster);
+                                                g_bpb.reserved_sectors,
+                                                g_bpb.num_fats,
+                                                g_bpb.sec_per_fat,
+                                                g_bpb.sectors_per_cluster);
+    } else {
+        sector_lba = clustertolba48(dir_cluster,
+                                                    vol_start_lba,
+                                                    g_bpb.reserved_sectors,
+                                                    g_bpb.num_fats,
+                                                    g_bpb.sec_per_fat,
+                                                    g_bpb.sectors_per_cluster);
+    }
 
 
 
-    for (int i = 0; i < bpb.bp.sectors_per_cluster; i++){
+    for (int i = 0; i < g_bpb.sectors_per_cluster; i++){
         ata_read_sector(sector_lba + i, (uint8_t *)cluster + (i * 512));
     }
 
@@ -397,11 +454,12 @@ int findfat_file(const char * fname){
      * Read directory entries
      */
     uint64_t off = 0;
-    struct direntry * dir;
+    struct direntry * dir = NULL;
 
 
-    while (off < (uint64_t)bpb.bp.sectors_per_cluster * bpb.bp.bytes_per_sector){
-        dir = (struct direntry *) ((uint8_t *)cluster + off);
+
+    while (off < (uint64_t)g_bpb.sectors_per_cluster * g_bpb.bytes_per_sector){
+        dir = (struct direntry *) ((uint8_t *)cluster + off);               // here dir should point to at worst the top of a page
 
         if (dir->name[0] == 0x00) goto NotFound;
         if (dir->name[0] == 0xE5){ off+= sizeof(struct direntry); continue;}
@@ -409,24 +467,43 @@ int findfat_file(const char * fname){
 
         off+= sizeof(struct direntry);
 
-
-        if (memcmp(dir->name, fat_name, 11)) goto Found; // read past the end of le buffer intentional
+        if (memcmp(dir->name, fat_name, 11) == 0) goto Found; // read past the end of le buffer intentional
 
         }
 
 
+NotFound:
+    retpage(cluster);
+    printf("file %s not found returning null\n", fname);
+    return -1;
 
 
 Found:
-
-    printf("Found file \n");
-
-
+    *out = *dir;
     retpage(cluster);
     return 0;
+}
+
+struct file_fat32 fat_open(const char * path){
+    struct file_fat32 ret = {0};
+    struct direntry dirent = {0};
+    char component[256];
 
 
-NotFound:
-    retpage(cluster);
-    return 2;
+    while (next_path_component(&path, component, sizeof(component))) {
+        printf("component: %s \n", component);
+
+         if (findfat_file(component, &dirent, HL_CLUSTER) != 0){
+             printf("Failed to read disk at %ul", HL_CLUSTER);
+             return ret;
+         }
+
+        while (*path++ == '/') path++;
+
+        if (*path == '\0')  return dirent2fat32file(dirent);
+        if (dirent.flags != 0x10) return ret;
+    }
+
+
+    return ret;
 }
