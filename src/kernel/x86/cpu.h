@@ -2,7 +2,7 @@
 #pragma once
 
 static inline void cpu_takebreak(void){
-    __asm__ volatile ("pause");
+    __asm__ volatile ("pause" ::: "memory");
 }
 static inline void cpu_stop_interrupts(void){
     __asm__ volatile ("cli");

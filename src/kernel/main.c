@@ -150,6 +150,12 @@ void kentry(void) {
 
 
     size_t frame = 0;
+    uint64_t real_temp = 0;
+    for (uint16_t i = 0; i < 10000; i++) cpu_takebreak();               // wait for the temperature to start or something lol
+
+    real_temp = atomic_load(&temperature);
+
+    printf("Welcome to dej os the temperature is %llu \n", real_temp);
 
     while (1) {
         for (size_t y = 0; y < framebuffer->height; y++) {
