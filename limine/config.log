@@ -27,9 +27,13 @@ uname -v = #1 SMP PREEMPT_DYNAMIC Mon Aug 10 03:32:13 UTC 2026
 /usr/bin/oslevel       = unknown
 /bin/universe          = unknown
 
-PATH: /home/baller/Downloads/watcom/binl/
+PATH: /usr/local/sbin/
 PATH: /usr/local/bin/
+PATH: /usr/sbin/
 PATH: /usr/bin/
+PATH: /sbin/
+PATH: /bin/
+PATH: /var/lib/snapd/snap/bin/
 
 
 ## ----------- ##
@@ -46,7 +50,7 @@ configure:2488: result: x86_64-pc-linux-gnu
 configure:2508: checking host system type
 configure:2523: result: x86_64-pc-linux-gnu
 configure:2644: checking for gcc
-configure:2665: found /usr/bin/gcc
+configure:2665: found /usr/sbin/gcc
 configure:2677: result: gcc
 configure:3036: checking for C compiler version
 configure:3045: gcc --version >&5
@@ -157,7 +161,7 @@ configure: failed program was:
 configure:3797: checking for x86_64-pc-linux-gnu-gcc
 configure:3833: result: no
 configure:3843: checking for gcc
-configure:3864: found /usr/bin/gcc
+configure:3864: found /usr/sbin/gcc
 configure:3876: result: gcc
 configure:4235: checking for C compiler version
 configure:4244: gcc --version >&5
@@ -266,21 +270,21 @@ configure: failed program was:
 | /* end confdefs.h.  */
 | #include <ac_nonexistent.h>
 configure:4982: checking for a race-free mkdir -p
-configure:5025: result: /usr/bin/mkdir -p
+configure:5025: result: /usr/sbin/mkdir -p
 configure:5044: checking for a BSD-compatible install
 configure:5118: result: /usr/bin/install -c
 configure:5130: checking for a sed that does not truncate output
-configure:5202: result: /usr/bin/sed
+configure:5202: result: /usr/sbin/sed
 configure:5208: checking for grep that handles long lines and -e
-configure:5274: result: /usr/bin/grep
+configure:5274: result: /usr/sbin/grep
 configure:5284: checking for gawk
-configure:5305: found /usr/bin/gawk
+configure:5305: found /usr/sbin/gawk
 configure:5317: result: gawk
 configure:5332: checking for find
-configure:5353: found /usr/bin/find
+configure:5353: found /usr/sbin/find
 configure:5365: result: yes
 configure:5495: checking for strip
-configure:5516: found /usr/bin/strip
+configure:5516: found /usr/sbin/strip
 configure:5528: result: strip
 configure:5623: checking for stdio.h
 configure:5623: gcc -c -g -O2 -pipe  conftest.c >&5
@@ -353,19 +357,19 @@ configure:5651: gcc -c -g -O2 -pipe  conftest.c >&5
 configure:5651: $? = 0
 configure:5651: result: yes
 configure:5712: checking for clang
-configure:5733: found /usr/bin/clang
+configure:5733: found /usr/sbin/clang
 configure:5745: result: yes
 configure:5948: checking for ld.lld
-configure:5969: found /usr/bin/ld.lld
+configure:5969: found /usr/sbin/ld.lld
 configure:5981: result: yes
 configure:6184: checking for llvm-objcopy
-configure:6205: found /usr/bin/llvm-objcopy
+configure:6205: found /usr/sbin/llvm-objcopy
 configure:6217: result: yes
 configure:6420: checking for llvm-objdump
-configure:6441: found /usr/bin/llvm-objdump
+configure:6441: found /usr/sbin/llvm-objdump
 configure:6453: result: yes
 configure:6656: checking for llvm-readelf
-configure:6677: found /usr/bin/llvm-readelf
+configure:6677: found /usr/sbin/llvm-readelf
 configure:6689: result: yes
 configure:7310: creating ./config.status
 
@@ -398,8 +402,8 @@ ac_cv_build_prog_cc_c11=
 ac_cv_build_prog_cc_g=yes
 ac_cv_build_prog_cc_stdc=
 ac_cv_c_compiler_gnu=yes
-ac_cv_env_CC_FOR_TARGET_set=set
-ac_cv_env_CC_FOR_TARGET_value=clang
+ac_cv_env_CC_FOR_TARGET_set=
+ac_cv_env_CC_FOR_TARGET_value=
 ac_cv_env_CC_set=
 ac_cv_env_CC_value=
 ac_cv_env_CFLAGS_FOR_TARGET_set=
@@ -459,10 +463,10 @@ ac_cv_host_c_compiler_gnu=yes
 ac_cv_host_exeext=
 ac_cv_host_objext=o
 ac_cv_objext=o
-ac_cv_path_GREP=/usr/bin/grep
-ac_cv_path_SED=/usr/bin/sed
+ac_cv_path_GREP=/usr/sbin/grep
+ac_cv_path_SED=/usr/sbin/sed
 ac_cv_path_install='/usr/bin/install -c'
-ac_cv_path_mkdir=/usr/bin/mkdir
+ac_cv_path_mkdir=/usr/sbin/mkdir
 ac_cv_prog_AWK=gawk
 ac_cv_prog_CC_FOR_TARGET_FOUND=yes
 ac_cv_prog_CPP='gcc -E'
@@ -513,7 +517,7 @@ ECHO_N='-n'
 ECHO_T=''
 EXEEXT=''
 FIND_FOUND='yes'
-GREP='/usr/bin/grep'
+GREP='/usr/sbin/grep'
 INSTALL_DATA='${INSTALL} -m 644'
 INSTALL_PROGRAM='${INSTALL}'
 INSTALL_SCRIPT='${INSTALL}'
@@ -526,7 +530,7 @@ LIBOBJS=''
 LIBS=''
 LIMINE_COPYRIGHT='Copyright (C) 2019-2026 Mintsuki and contributors.'
 LTLIBOBJS=''
-MKDIR_P='/usr/bin/mkdir -p'
+MKDIR_P='/usr/sbin/mkdir -p'
 MTOOLS_FOUND=''
 NASMFLAGS_FOR_TARGET='-g'
 NASM_FOUND=''
@@ -545,7 +549,7 @@ PATH_SEPARATOR=':'
 READELF_FOR_TARGET='llvm-readelf'
 READELF_FOR_TARGET_FOUND='yes'
 REGEN_DATE='August 2026'
-SED='/usr/bin/sed'
+SED='/usr/sbin/sed'
 SHELL='/bin/sh'
 SOURCE_DATE_EPOCH='1785671462'
 SOURCE_DATE_EPOCH_TOUCH='202608021351'

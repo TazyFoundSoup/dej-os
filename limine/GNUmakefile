@@ -44,11 +44,11 @@ INSTALL_PROGRAM := ${INSTALL}
 INSTALL_DATA := ${INSTALL} -m 644
 STRIP := strip
 
-MKDIR_P := /usr/bin/mkdir -p
+MKDIR_P := /usr/sbin/mkdir -p
 export MKDIR_P
-GREP := /usr/bin/grep
+GREP := /usr/sbin/grep
 export GREP
-SED := /usr/bin/sed
+SED := /usr/sbin/sed
 export SED
 AWK := gawk
 export AWK
