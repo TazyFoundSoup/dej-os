@@ -2,6 +2,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include "../../random.h"
+#include "../../cpu.h"
 extern _Atomic uint64_t temperature;
 
 volatile uint64_t ap_started = 0;
@@ -17,14 +18,12 @@ void ap_entry(struct limine_mp_info *cpu)
         }
 
         if (atomic_load(&cpu_running) == true) {
-          __asm__ volatile("cli");
-          while (true) {
-            __asm__ volatile("hlt");
-          }
+          cpu_stop_interrupts();
+          cpu_stop();
         }
 
-        __asm__ volatile ("pause");
-        __asm__ volatile ("pause"); // chill bro
+
+        cpu_takebreak(); // chill bro
     }
 
 }       // inside my kernel that i made lol

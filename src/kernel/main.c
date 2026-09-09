@@ -8,8 +8,11 @@
 #include <stdint.h>
 #include "panic.h"
 #include "msr.h"
-#include "cpu/cpu1/temprature.h"
 #include <stdatomic.h>
+#include "cpu.h"
+#include "x86/cpu.h"
+
+extern void ap_entry(struct limine_mp_info *cpu);
 
 __attribute__((section(".temperature")))
 _Atomic uint64_t temperature;
@@ -160,7 +163,7 @@ void kentry(void) {
                     (red << 16) | (green << 8) | blue;
             }
         }
-        for (int i = 0; i < 100; i++) __asm__ volatile ("pause");
+        for (int i = 0; i < 100; i++) cpu_takebreak();
         frame++;
     }
 
@@ -171,5 +174,5 @@ void kentry(void) {
 
 
 
-    for (;;) __asm__ volatile ("hlt"); // yo dont forget
+    cpu_stop(); // yo dont forget
 }

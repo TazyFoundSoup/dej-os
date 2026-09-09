@@ -1,4 +1,5 @@
 #include "../stdio.h"
+#include "../cpu.h"
 #include "../x86.h"
 #include "../msr.h"
 #include "../panic.h"
@@ -84,7 +85,7 @@ void nmi_handler(nmi_registers_t * regs){
         res &= ~(1ULL << 2);
         wrmsr(0x17A, res);
 
-        while (true) __asm__ volatile ("cli; hlt");
+        cpu_stop();
     }
     // we prob cooked gang
     //

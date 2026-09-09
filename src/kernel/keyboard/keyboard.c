@@ -8,11 +8,12 @@
 #include "stddef.h"
 #include <stdint.h>
 #include "keyboard.h"
+#include "../cpu.h"
 
 #define waittosend while (x86_inb(0x64) & 0x02) \
-    __asm__ volatile ("nop");
+    cpu_takebreak();
 #define waitfordata while (!(x86_inb(0x64) & 0x01)) \
-    __asm__ volatile ("nop");
+    cpu_takebreak();
 
 
 //0x60 = keyboard/controller DATA port
