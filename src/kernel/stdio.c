@@ -1,6 +1,6 @@
-#include "stdio.h"
-#include "x86.h"
-#include "x86/cpu.h"
+#include <stdio.h>
+#include <x86.h>
+#include <cpu.h>
 
 #include <stdarg.h>
 #include <stdatomic.h>

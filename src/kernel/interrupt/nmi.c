@@ -1,11 +1,12 @@
-#include "../stdio.h"
-#include "../cpu.h"
-#include "../x86.h"
-#include "../msr.h"
-#include "../panic.h"
+#include <stdio.h>
+#include <cpu.h>
+#include <msr.h>
+#include <panic.h>
+#include <panic.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <x86.h>
 
 typedef struct {
     // General-purpose registers (pushed manually by assembly)

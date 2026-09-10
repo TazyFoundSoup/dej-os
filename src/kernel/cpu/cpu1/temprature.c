@@ -1,9 +1,9 @@
-#include "../../lim/limine.h"
+#include <lim/limine.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include "../../random.h"
-#include "../../cpu.h"
+#include <random.h>
+#include <cpu.h>
 extern _Atomic uint64_t temperature;
 
 volatile uint64_t ap_started = 0;

@@ -3,12 +3,12 @@
 // For ps2 keyboard support
 // built on assumptions
 //
-#include "../x86.h"
-#include "stdbool.h"
-#include "stddef.h"
+#include <x86.h>
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "keyboard.h"
-#include "../cpu.h"
+#include <cpu.h>
 
 #define waittosend while (x86_inb(0x64) & 0x02) \
     cpu_takebreak();
