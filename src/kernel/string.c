@@ -94,9 +94,15 @@ char * strcpy(char *restrict dst, const char *restrict src){
 	return ret;
 }
 
-char *strncpy(char *restrict dst, const char *restrict src, size_t size)
-{
-    char *ret = dst;
+char * strncpy(char *restrict dst, const char *restrict src, size_t size){
+	size_t i = 0;
+	char * ret = dst;
+	while ((*dst++ = *src++ )&& (i < size)){
+		i++;
+	}
+	while (i < size){
+		*dst++ = '\0';
+	}
 
     while (size && (*dst++ = *src++)) {
         size--;
@@ -117,6 +123,8 @@ int strcmp(const char * s1, const char * s2){
     }
     return (unsigned char )*s1 - (unsigned char)*s2;
 }
+
+
 
 
 
@@ -142,6 +150,7 @@ int strncmp(const char *s1, const char *s2, size_t size)
 }
 
 
+
 char *strcat(char *restrict dst, const char *restrict src)
 {
     char *ret = dst;
@@ -155,7 +164,6 @@ char *strcat(char *restrict dst, const char *restrict src)
 }
 
 
-
 size_t strlen(const char *restrict src){
 	size_t ret = 0;
 	while (*src++ != '\0'){
@@ -163,6 +171,7 @@ size_t strlen(const char *restrict src){
 	}
 	return ret;
 }
+
 
 
 size_t strnlen(const char *src, size_t size)

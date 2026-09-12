@@ -3,7 +3,7 @@ KERNEL_DIR := src/kernel
 
 ASM := nasm
 CC := gcc
-CCFLAGS := -ffreestanding -fno-stack-protector -fno-pie -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-builtin -fno-omit-frame-pointer -mno-red-zone -m64 -mcmodel=kernel -std=c11 -Wall -Werror -g -mrdrnd -O2 -I./src/kernel
+CCFLAGS := -ffreestanding -fno-stack-protector -fno-pie -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-builtin -fno-omit-frame-pointer -mno-red-zone -m64 -mcmodel=kernel -std=c11 -g3 -mrdrnd -Wall -Wextra -Werror -Wpedantic -O2 -mno-sse -I./src/kernel
 # bro too many args bro
 LD := ld.lld
 
@@ -58,6 +58,7 @@ $(IMAGE): $(KERNEL) limine.conf
 	sudo cp $(KERNEL) $(MNT)/boot/kernel.elf
 	sudo cp limine.conf $(MNT)/limine.conf
 	sudo cp $(LIMINE_DIR)/bin/limine-bios.sys $(MNT)/boot/limine/limine-bios.sys
+	sudo cp test.txt $(MNT)/test.txt
 
 	sudo umount $(MNT)
 	sudo losetup -d $$(cat $(BUILD_DIR)/loopdev)
@@ -74,6 +75,7 @@ always:
 	mkdir -p build/memory
 	mkdir -p build/x86/
 	mkdir -p build/cpu/cpu1/
+	mkdir -p build/disk
 
 clean:
 	sudo umount $(MNT) 2>/dev/null || true

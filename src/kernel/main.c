@@ -10,6 +10,7 @@
 #include <msr.h>
 #include <stdatomic.h>
 #include <cpu.h>
+#include <disk/ata.h>
 
 extern void ap_entry(struct limine_mp_info *cpu);
 
@@ -138,15 +139,16 @@ void kentry(void) {
         }
     }
 
+    int a = ata_init();
+    printf("Disk init returned %i \n", a);
+    struct file_fat32 f = fat_open("boot/kernel.elf");
+    if (!f.first_cluster) printf("failed to open le file\n");
+    else printf("Opened file first cluster = %lu \n", f.first_cluster);
 
 
     // Fetch the first framebuffer.
     struct limine_framebuffer *framebuffer = framebuffer_request.response->framebuffers[0];
     volatile uint32_t *fb_ptr = framebuffer->address;
-
-
-
-
 
     size_t frame = 0;
     uint64_t real_temp = 0;
@@ -163,7 +165,6 @@ void kentry(void) {
                 uint32_t red = 256;
                 uint32_t green = (y + frame) % 256;
                 uint32_t blue =   (x + frame) % 256;
-
                 fb_ptr[y * (framebuffer->pitch / 4) + x] =
                     (red << 16) | (green << 8) | blue;
             }
