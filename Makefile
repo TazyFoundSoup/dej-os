@@ -3,7 +3,7 @@ KERNEL_DIR := src/kernel
 
 ASM := nasm
 CC := gcc
-CCFLAGS := -ffreestanding -fno-stack-protector -fno-pie -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-builtin -fno-omit-frame-pointer -mno-red-zone -m64 -mcmodel=kernel -std=c11 -g3 -mrdrnd -Wall -Wextra -Werror -Wpedantic -O2 -mno-sse -I./src/kernel
+CCFLAGS := -ffreestanding -fno-stack-protector -fno-pie -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-builtin -fno-omit-frame-pointer -mno-red-zone -m64 -mcmodel=kernel -std=c11 -g3 -mrdrnd -Wall -Wextra -Werror -Wpedantic -O2 -mno-sse -I./src/kernel/include -I./src/kernel/arch
 # bro too many args bro
 LD := ld.lld
 
@@ -69,13 +69,14 @@ run: image
 	qemu-system-x86_64 -drive format=raw,file=$(IMAGE)
 
 always:
-	mkdir -p build/
+	mkdir -p build/arch/x86
 	mkdir -p build/keyboard
 	mkdir -p build/interrupt
 	mkdir -p build/memory
 	mkdir -p build/x86/
 	mkdir -p build/cpu/cpu1/
 	mkdir -p build/disk
+	mkdir -p build/include/dej
 
 clean:
 	sudo umount $(MNT) 2>/dev/null || true

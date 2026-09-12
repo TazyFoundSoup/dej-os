@@ -2,9 +2,9 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "ata.h"
-#include "../string.h"
-#include "../x86.h"
-#include "../stdio.h"
+#include <dej/string.h>
+#include "../arch/x86/x86.h"
+#include <dej/stdio.h>
 #include "../memory/memory.h"
 
 

@@ -1,16 +1,16 @@
 // the kernel ig
-#include <x86.h>
-#include <lim/limine.h>
-#include <stdio.h>
-#include <interrupt/interrupt.h>
-#include <memory/memory.h>
-#include <string.h>
+#include <x86/x86.h>
+#include <limine.h>
+#include <dej/stdio.h>
+#include "interrupt/interrupt.h"
+#include "memory/memory.h"
+#include <dej/string.h>
 #include <stdint.h>
-#include <panic.h>
-#include <msr.h>
+#include <dej/panic.h>
+#include <dej/msr.h>
 #include <stdatomic.h>
-#include <cpu.h>
-#include <disk/ata.h>
+#include <dej/cpu.h>
+#include "disk/ata.h"
 
 extern void ap_entry(struct limine_mp_info *cpu);
 

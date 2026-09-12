@@ -1,9 +1,8 @@
 #include <stdint.h>
-#include <cpu.h>
-#include <x86.h>
-#include <stdio.h>
-#include <panic.h>
-#include <msr.h>
+#include <dej/cpu.h>
+#include <x86/x86.h>
+#include <dej/stdio.h>
+#include <dej/panic.h>
 
 struct InterruptDescriptor {
     uint16_t offset_1;

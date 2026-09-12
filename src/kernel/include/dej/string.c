@@ -1,4 +1,4 @@
-#include <string.h>
+#include <dej/string.h>
 
 void* memcpy(void* dst, const void* src, size_t num)
 {
