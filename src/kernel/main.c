@@ -10,6 +10,7 @@
 #include <msr.h>
 #include <stdatomic.h>
 #include <cpu.h>
+#include <disk/ata.h>
 
 extern void ap_entry(struct limine_mp_info *cpu);
 
