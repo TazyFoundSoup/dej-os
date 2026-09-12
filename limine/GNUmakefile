@@ -17,10 +17,10 @@ override datarootdir := ${prefix}/share
 override mandir := ${datarootdir}/man
 override docdir := ${datarootdir}/doc/${PACKAGE_TARNAME}
 
-override BUILDDIR := /home/baller/src/limine
+override BUILDDIR := /home/baller/src/dej-os/limine
 override BINDIR := $(BUILDDIR)/bin
 
-override SRCDIR := /home/baller/src/limine
+override SRCDIR := /home/baller/src/dej-os/limine
 
 override SPACE := $(subst ,, )
 override COMMA := ,
@@ -29,7 +29,7 @@ override MKESCAPE = $(subst $(SPACE),\ ,$(1))
 override SHESCAPE = $(subst ','\'',$(1))
 override NASMESCAPE = $(subst ','"'$(COMMA) \"'\"$(COMMA) '"',$(1))
 
-override BUILD_BIOS := limine-bios
+override BUILD_BIOS := 
 override BUILD_UEFI_X86_64 := 
 override BUILD_UEFI_IA32 := 
 override BUILD_UEFI_AARCH64 := 
@@ -44,11 +44,11 @@ INSTALL_PROGRAM := ${INSTALL}
 INSTALL_DATA := ${INSTALL} -m 644
 STRIP := strip
 
-MKDIR_P := /usr/bin/mkdir -p
+MKDIR_P := /usr/sbin/mkdir -p
 export MKDIR_P
-GREP := /usr/bin/grep
+GREP := /usr/sbin/grep
 export GREP
-SED := /usr/bin/sed
+SED := /usr/sbin/sed
 export SED
 AWK := gawk
 export AWK

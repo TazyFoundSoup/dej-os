@@ -1,7 +1,9 @@
-#include "stdio.h"
-#include "x86.h"
+#include <stdio.h>
+#include <x86.h>
+#include <cpu.h>
 
 #include <stdarg.h>
+#include <stdatomic.h>
 
 #define puts(x) serial_puts(x)
 void serial_puts(const char *s) {
@@ -63,6 +65,8 @@ char* uint64_to_hex(uint64_t value, char *buffer) {
     return &buffer[i];
 }
 
+static atomic_flag serial_lock = ATOMIC_FLAG_INIT;
+
 const char g_HexChars[] = "0123456789abcdef";
 void printf_unsigned(unsigned long long number, int radix)
 {
@@ -106,6 +110,11 @@ void printf_signed(long long number, int radix)
 #define PRINTF_LENGTH_LONG_LONG     4
 void printf(const char* fmt, ...)
 {
+    while (atomic_flag_test_and_set_explicit(&serial_lock, memory_order_acquire)) {
+            // wait for lock bro
+            cpu_takebreak();
+        }                                   // lock stuff
+
     va_list args;
     va_start(args, fmt);
 
@@ -242,6 +251,8 @@ void printf(const char* fmt, ...)
     }
 
     va_end(args);
+
+    atomic_flag_clear_explicit(&serial_lock, memory_order_release);
 }
 
 void print_buffer(const char* msg, const void* buffer, uint32_t count)

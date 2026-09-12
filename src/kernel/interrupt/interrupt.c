@@ -1,8 +1,9 @@
 #include <stdint.h>
-#include "../x86.h"
-#include "../stdio.h"
-#include "../panic.h"
-#include "../msr.h"
+#include <cpu.h>
+#include <x86.h>
+#include <stdio.h>
+#include <panic.h>
+#include <msr.h>
 
 struct InterruptDescriptor {
     uint16_t offset_1;
@@ -45,7 +46,7 @@ void idt_set_gate(uint8_t vector, void (*handler)(void))
 extern void int_divide_by_0(void);
 void divide_by_0_handler(void){
     serial_puts("Division by 0 occured");
-    for (;;) __asm__ volatile ("cli; hlt");
+    cpu_stop();
 }
 
 extern void int_nmi(void);
@@ -54,14 +55,14 @@ extern void int_nmi(void);
 extern void int_general_protection_fault(void);
 void general_protection_fault_handler(void){
     serial_puts("gp fault yo lowk im hungry");
-    for (;;) __asm__ volatile ("cli; hlt");
+    cpu_stop();
 }
 
 
 extern void int_page_fault(void);
 void page_fault_handler(void){
     serial_puts("page fault");
-    for (;;) __asm__ volatile ("cli; hlt");
+    cpu_stop();
 }
 
 

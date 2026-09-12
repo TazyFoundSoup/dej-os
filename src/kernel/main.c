@@ -1,16 +1,17 @@
 // the kernel ig
-#include "x86.h"
-#include "lim/limine.h"
-#include "stdio.h"
-#include "interrupt/interrupt.h"
-#include "memory/memory.h"
-#include "string.h"
+#include <x86.h>
+#include <lim/limine.h>
+#include <stdio.h>
+#include <interrupt/interrupt.h>
+#include <memory/memory.h>
+#include <string.h>
 #include <stdint.h>
-#include "panic.h"
-#include "msr.h"
-#include "cpu/cpu1/temprature.h"
+#include <panic.h>
+#include <msr.h>
 #include <stdatomic.h>
-#include "disk/ata.h"
+#include <cpu.h>
+
+extern void ap_entry(struct limine_mp_info *cpu);
 
 __attribute__((section(".temperature")))
 _Atomic uint64_t temperature;
@@ -68,7 +69,7 @@ void serial_init(void)
 void kentry(void) {
     if (atomic_exchange(&kentry_ran, true)) panic("kentry ran twice");
     atomic_store(&cpu_running, true);
-    atomic_exchange(&kentry_ran, true);
+    atomic_store(&kentry_ran, true);
 
     // Ensure the bootloader actually gets us
     if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false) {
@@ -156,8 +157,31 @@ void kentry(void) {
             uint32_t blue = 255;
             uint32_t green = nY;
 
-            fb_ptr[y * (framebuffer->pitch / 4) + x] = (red << 16) | (green << 8) | blue;
+
+
+
+    size_t frame = 0;
+    uint64_t real_temp = 0;
+    for (uint16_t i = 0; i < 10000; i++) cpu_takebreak();               // wait for the temperature to start or something lol
+
+    real_temp = atomic_load(&temperature);
+
+    printf("Welcome to dej os the temperature is %llu \n", real_temp);
+
+    while (1) {
+        for (size_t y = 0; y < framebuffer->height; y++) {
+            for (size_t x = 0; x < framebuffer->width; x++) {
+
+                uint32_t red = 256;
+                uint32_t green = (y + frame) % 256;
+                uint32_t blue =   (x + frame) % 256;
+
+                fb_ptr[y * (framebuffer->pitch / 4) + x] =
+                    (red << 16) | (green << 8) | blue;
+            }
         }
+        for (int i = 0; i < 100; i++) cpu_takebreak();
+        frame++;
     }
 
 
@@ -166,5 +190,6 @@ void kentry(void) {
 
 
 
-    for (;;) __asm__ volatile ("hlt"); // yo dont forget
+
+    cpu_stop(); // yo dont forget
 }
