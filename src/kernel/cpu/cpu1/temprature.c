@@ -4,15 +4,15 @@
 #include <dej/stdio.h>
 #include <dej/random.h>
 #include <dej/cpu.h>
+#include <dej/percpu.h>
 extern _Atomic uint64_t temperature;
 
 volatile uint64_t ap_started = 0;
-extern _Atomic bool cpu_running;
 
-void ap_entry(struct limine_mp_info *cpu)
+void temperature_entry(void)
 {
     uint64_t random;
-    printf("cpu %i is ready to read the temperature\n", cpu->lapic_id);
+    printf("cpu %i is ready to read the temperature\n", percpu_read(cpu_id));
 
     for (;;){
         if (rdrand(&random)) {
@@ -22,7 +22,7 @@ void ap_entry(struct limine_mp_info *cpu)
             cpu_stop();
         }
 
-        if (atomic_load(&cpu_running) == true) {
+        if (percpu_read(cpu_state) & 0x1) {
           cpu_stop_interrupts();
           cpu_stop();
         }
@@ -31,4 +31,4 @@ void ap_entry(struct limine_mp_info *cpu)
         cpu_takebreak(); // chill bro
     }
 
-}       // inside my kernel that i made lol
+}       // trust temperature is real bro

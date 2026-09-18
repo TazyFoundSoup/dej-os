@@ -4,6 +4,14 @@
 #include <dej/stdio.h>
 #include <dej/panic.h>
 
+typedef struct {
+    // General-purpose registers (pushed manually by assembly)
+    uint64_t rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15;
+
+    // Hardware frame
+    uint64_t ec, rip, cs, rflags;
+} __attribute__((packed)) gp_registers_t;
+
 struct InterruptDescriptor {
     uint16_t offset_1;
     uint16_t selector;
@@ -52,8 +60,9 @@ extern void int_nmi(void);
 //in nmi.c
 
 extern void int_general_protection_fault(void);
-void general_protection_fault_handler(void){
-    serial_puts("gp fault yo lowk im hungry");
+void general_protection_fault_handler(gp_registers_t * frame){
+    printf("gp fault:  rflags %lu cs %lu rip %lu error code %lu", frame->rflags, frame->cs, frame->rip, frame->ec);
+
     cpu_stop();
 }
 

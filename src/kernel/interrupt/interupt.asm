@@ -66,6 +66,7 @@ global int_general_protection_fault
 int_general_protection_fault:
     PUSH_ALL
 
+    mov rdi, rsp
     call general_protection_fault_handler
 
 

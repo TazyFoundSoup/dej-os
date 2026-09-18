@@ -53,7 +53,6 @@ static volatile uint64_t limine_requests_end_marker[] = LIMINE_REQUESTS_END_MARK
 
 
 static _Atomic bool kentry_ran = false;
-_Atomic bool cpu_running;
 
 void serial_init(void)
 {
@@ -69,7 +68,6 @@ void serial_init(void)
 
 void kentry(void) {
     if (atomic_exchange(&kentry_ran, true)) panic("kentry ran twice");
-    atomic_store(&cpu_running, true);
     atomic_store(&kentry_ran, true);
 
     // Ensure the bootloader actually gets us
@@ -118,7 +116,7 @@ void kentry(void) {
 
     }
 
-    serial_puts("kentry\n");
+    printf("kentry\n");
 
 
 
