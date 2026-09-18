@@ -1,4 +1,3 @@
-#include "x86/cpu.h"
 #include <dej/stdio.h>
 #include <stdatomic.h>
 #include <stddef.h>

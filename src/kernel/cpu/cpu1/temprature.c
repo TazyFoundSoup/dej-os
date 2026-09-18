@@ -1,4 +1,3 @@
-#include "x86/cpu.h"
 #include <limine.h>
 #include <stdatomic.h>
 #include <stdbool.h>
