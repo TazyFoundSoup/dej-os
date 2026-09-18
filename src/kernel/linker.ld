@@ -61,6 +61,14 @@ SECTIONS
     KEEP(*(.temperature))
     } :data
 
+    .percpu ALIGN(64) :
+{
+    __percpu_start = .;
+    *(.percpu)
+    *(.percpu.*)
+    __percpu_end = .;
+}
+
 
     /* NOTE: .bss needs to be the last thing mapped to :data, otherwise lots of */
     /* unnecessary zeros will be written to the binary. */

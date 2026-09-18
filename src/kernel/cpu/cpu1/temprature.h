@@ -1,2 +1,2 @@
-#include <lim/limine.h>
-void ap_entry(struct limine_mp_info *cpu);
+#include <limine.h>
+void temperature_entry(void);
