@@ -7,6 +7,7 @@
 #include <dej/string.h>
 #include <dej/msr.h>
 #include <dej/interrupt.h>
+#include <dej/percpu.h>
 
 
 #define MSR_GS_BASE 0xC0000101

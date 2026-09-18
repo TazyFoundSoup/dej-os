@@ -54,4 +54,4 @@ extern char __percpu_end[];
 extern DEFINE_PERCPU(uint64_t, irq);
 extern DEFINE_PERCPU(uint64_t, sil);
 extern DEFINE_PERCPU(uint64_t, cpu_id);
-extern DEFINE_PERCPU(uint64_t, cpu_state);
+extern DEFINE_PERCPU(_Atomic uint64_t, cpu_state);
