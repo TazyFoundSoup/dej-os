@@ -80,7 +80,7 @@ void page_fault_handler(void){
 
 
 
-void idt_init(void){
+void InInterruptInit(void){
 
 
     idt_set_gate(0, int_divide_by_0);

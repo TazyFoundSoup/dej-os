@@ -99,7 +99,7 @@ void kentry(void) {
 
 
     serial_init();
-    idt_init();
+    InInterruptInit();
     memory_init(memmap_request.response, hhdm_request.response);
 
 

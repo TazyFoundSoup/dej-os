@@ -1,7 +1,5 @@
 // cpu.h
 #pragma once
-#include <stdint.h>
-#include <stddef.h>
 
 static inline void cpu_takebreak(void){
     __asm__ volatile ("pause" ::: "memory");

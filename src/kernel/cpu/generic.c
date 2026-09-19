@@ -33,7 +33,7 @@ void ap_entry(struct limine_mp_info *cpu){
     atomic_fetch_add(&core, +1);
 
     cpu_stop_interrupts();
-    idt_init();
+    InInterruptInit();
 
     if (percpu_size >= 4096){
         panic("percpu tables too big prob like something wrong or ill fix it later or something\n");
