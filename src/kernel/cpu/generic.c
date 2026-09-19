@@ -8,6 +8,7 @@
 #include <dej/msr.h>
 #include <dej/interrupt.h>
 #include <dej/percpu.h>
+#include <dej/stdio.h>
 
 
 #define MSR_GS_BASE 0xC0000101
@@ -18,17 +19,21 @@
  *
  */
 
+DEFINE_PERCPU(_Atomic uint64_t, cpu_state);
 DEFINE_PERCPU(uint64_t, irq);
 DEFINE_PERCPU(uint64_t, sil);
 DEFINE_PERCPU(uint64_t, cpu_id);
-DEFINE_PERCPU(_Atomic uint64_t, cpu_state);
+
+
+static _Atomic uint8_t core = 0;
 
 void ap_entry(struct limine_mp_info *cpu){
+    core++;
     cpu_stop_interrupts();
     idt_init();
 
     if (percpu_size >= 4096){
-        panic("percpu tables too big prob like something wrong or ill fix it later or something");
+        panic("percpu tables too big prob like something wrong or ill fix it later or something\n");
     }
 
     char * n_block = givemeapage();
@@ -42,5 +47,21 @@ void ap_entry(struct limine_mp_info *cpu){
     percpu_write(cpu_id, cpu->lapic_id);
 
     cpu_enable_interrupts();
-    temperature_entry() ;
+    percpu_write(sil, 0);       // enable all interrupts
+
+    cpu_percpu[core] = (uint8_t *)&n_block;
+
+    switch (core) {
+        case 1: {
+            temperature_entry();
+            goto ret;
+        }
+        default: cpu_stop();
+    }
+
+ret:
+    printf("core %ul returned halting on core\n", percpu_read(cpu_id));
+    percpu_write(sil, 10);
+    percpu_write(cpu_state, 0x1);
+    cpu_stop();
 }

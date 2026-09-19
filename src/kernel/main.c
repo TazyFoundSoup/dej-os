@@ -11,6 +11,7 @@
 #include <stdatomic.h>
 #include <dej/cpu.h>
 #include "disk/ata.h"
+#include <dej/percpu.h>
 
 extern void ap_entry(struct limine_mp_info *cpu);
 
@@ -138,10 +139,9 @@ void kentry(void) {
     }
 
     int a = ata_init();
-    printf("Disk init returned %i \n", a);
+    if (a != 0) printf("Disk init returned %i \n", a);
     struct file_fat32 f = fat_open("boot/kernel.elf");
     if (!f.first_cluster) printf("failed to open le file\n");
-    else printf("Opened file first cluster = %lu \n", f.first_cluster);
 
 
     // Fetch the first framebuffer.
@@ -150,7 +150,7 @@ void kentry(void) {
 
     size_t frame = 0;
     uint64_t real_temp = 0;
-    for (uint16_t i = 0; i < 10000; i++) cpu_takebreak();               // wait for the temperature to start or something lol
+    while (((uint64_t)cpu_percpu[1]  & 0x1)) cpu_takebreak();               // wait for the temperature to start or something lol
 
     real_temp = atomic_load(&temperature);
 
