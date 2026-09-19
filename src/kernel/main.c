@@ -1,17 +1,15 @@
 // the kernel ig
 #include <x86/x86.h>
-#include <limine.h>
 #include <dej/stdio.h>
 #include "interrupt/interrupt.h"
 #include "memory/memory.h"
 #include <dej/string.h>
-#include <stdint.h>
 #include <dej/panic.h>
 #include <dej/msr.h>
-#include <stdatomic.h>
 #include <dej/cpu.h>
 #include "disk/ata.h"
 #include <dej/percpu.h>
+#include <dej/kernel.h>
 
 extern void ap_entry(struct limine_mp_info *cpu);
 
@@ -72,34 +70,34 @@ void kentry(void) {
     atomic_store(&kentry_ran, true);
 
     // Ensure the bootloader actually gets us
-    if (LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false) {
+    if (unlikely(LIMINE_BASE_REVISION_SUPPORTED(limine_base_revision) == false)) {
         panic("Bootloader doesnt support our revision");
     }
 
     // Ensure we got a framebuffer.
-    if (framebuffer_request.response == NULL
-     || framebuffer_request.response->framebuffer_count < 1) {
+    if (unlikely(framebuffer_request.response == NULL
+     || framebuffer_request.response->framebuffer_count < 1)) {
          panic("Didnt recieve a framebuffer");
     }
 
     // make sure we got a memmap
-    if (memmap_request.response == NULL || memmap_request.response->entry_count < 1) {
+    if (unlikely(memmap_request.response == NULL || memmap_request.response->entry_count < 1)) {
         panic("Didnt recieve a memmap");
     }
 
     // make sure we got hhdm or something
-    if (hhdm_request.response == NULL){
+    if (unlikely(hhdm_request.response == NULL)){
         panic("Didnt recieve a hhdm");
     }
     // make sure we got a mp thing
-    if (mp_request.response == NULL){
+    if (unlikely(mp_request.response == NULL)){
         panic("Didnt recieve a mp");
     }
 
 
 
     serial_init();
-    InInterruptInit();
+    InterruptInit();
     memory_init(memmap_request.response, hhdm_request.response);
 
 
@@ -134,7 +132,7 @@ void kentry(void) {
                 ap_entry,
                 __ATOMIC_RELEASE
             );
-            break;
+            printf("sending cpu %i to ap entry\n", i);
         }
     }
 

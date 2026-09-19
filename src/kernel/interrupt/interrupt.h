@@ -1,3 +1,3 @@
 #include <stdint.h>
-void InInterruptInit(void);
-int LoRegisterInterruptVector(uint8_t vector, void (*handler)(void));
+void InterruptInit(void);
+void RegisterInterruptVector(uint8_t vector, void (*handler)(void));

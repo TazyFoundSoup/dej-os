@@ -79,6 +79,7 @@ always:
 	mkdir -p build/cpu/cpu1/
 	mkdir -p build/disk
 	mkdir -p build/include/dej
+	mkdir -p build/cpu/cpu2
 
 clean:
 	sudo umount $(MNT) 2>/dev/null || true

@@ -80,7 +80,7 @@ void page_fault_handler(void){
 
 
 
-void InInterruptInit(void){
+void InterruptInit(void){
 
 
     idt_set_gate(0, int_divide_by_0);
@@ -108,7 +108,7 @@ void InInterruptInit(void){
  * Name: name of function not driver
  *
  */
-void LoRegisterInterruptVector(uint8_t vector, void (*handler)(void), char * name){
+void RegisterInterruptVector(uint8_t vector, void (*handler)(void), char * name){
     if (vector <= 64) {
         panic("Attempted register reserved interrupt vector");
     }

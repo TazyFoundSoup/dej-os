@@ -380,7 +380,7 @@ int ata_init(void){
     if (strncmp((char *)buf.gpt_header.sig, "EFI PART", 8) != 0) return 0; // cmp efi partition casting sig into a char *
 
 
-    serial_puts("Found gpt header\n");
+    printf("Found gpt header\n");
 
     gpt_hp part_buf;
     if (ata_read_sector(buf.gpt_header.part_entry_lba, part_buf.raw) != 0) {

@@ -2,6 +2,7 @@
 #include <dej/cpu.h>
 #include <stdint.h>
 #include "cpu1/temprature.h"
+#include "cpu2/health.h"
 #include "../memory/memory.h"
 #include <dej/panic.h>
 #include <dej/string.h>
@@ -30,10 +31,10 @@ static _Atomic uint8_t core = 0;
 
 void ap_entry(struct limine_mp_info *cpu){
 
-    atomic_fetch_add(&core, +1);
+    uint64_t my_core = atomic_fetch_add(&core, 1) + 1;
 
     cpu_stop_interrupts();
-    InInterruptInit();
+    InterruptInit();
 
     if (percpu_size >= 4096){
         panic("percpu tables too big prob like something wrong or ill fix it later or something\n");
@@ -49,16 +50,20 @@ void ap_entry(struct limine_mp_info *cpu){
 
     percpu_write(cpu_id, cpu->lapic_id);
 
-    cpu_percpu[core] = (uint8_t *)n_block;
+    cpu_percpu[my_core] = (uint8_t *)n_block;
 
     cpu_enable_interrupts();
     percpu_write(sil, 0);       // enable all interrupts
 
-    switch (core) {
+    printf("enabling cpu %i \n", my_core);
+    switch (my_core) {
         case 1: {
             temperature_entry();
             break;
         }
+        case 2:
+            HealthMonitor();
+            break;
         default: cpu_stop();
     }
 

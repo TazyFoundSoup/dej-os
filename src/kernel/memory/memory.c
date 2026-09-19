@@ -1,15 +1,7 @@
-#include <limine.h>
 #include <dej/stdio.h>
-#include <stdbool.h>
-#include <stdint.h>
-#include <stddef.h>
 #include <dej/panic.h>
+#include <dej/kernel.h>
 
-#define KiB(x) (x) * 1024
-#define KB(x) (x )* 1000
-#define MB(x) KB(x) * 1000
-
-static char buffer[100];
 static uint64_t pages = 0;
 static bool inited = false;
 struct page{
@@ -36,8 +28,8 @@ int memory_init(struct limine_memmap_response * memmap, struct limine_hhdm_respo
                 // basically i aint gonna use yet but later sure
                 break;
             case LIMINE_MEMMAP_BAD_MEMORY:
-                printf("Bad memory at %ull ", memmap->entries[i]->base);
-                printf("Length %ull \r\n", memmap->entries[i]->length);
+                printf("Bad memory at %llu ", memmap->entries[i]->base);
+                printf("Length %llu \r\n", memmap->entries[i]->length);
                 break;
             case LIMINE_MEMMAP_ACPI_NVS:
                 break;
