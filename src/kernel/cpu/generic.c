@@ -9,6 +9,7 @@
 #include <dej/interrupt.h>
 #include <dej/percpu.h>
 #include <dej/stdio.h>
+#include <stdatomic.h>
 
 
 #define MSR_GS_BASE 0xC0000101
@@ -28,7 +29,9 @@ DEFINE_PERCPU(uint64_t, cpu_id);
 static _Atomic uint8_t core = 0;
 
 void ap_entry(struct limine_mp_info *cpu){
-    core++;
+
+    atomic_fetch_add(&core, +1);
+
     cpu_stop_interrupts();
     idt_init();
 
@@ -46,15 +49,15 @@ void ap_entry(struct limine_mp_info *cpu){
 
     percpu_write(cpu_id, cpu->lapic_id);
 
+    cpu_percpu[core] = (uint8_t *)n_block;
+
     cpu_enable_interrupts();
     percpu_write(sil, 0);       // enable all interrupts
-
-    cpu_percpu[core] = (uint8_t *)&n_block;
 
     switch (core) {
         case 1: {
             temperature_entry();
-            goto ret;
+            break;
         }
         default: cpu_stop();
     }
