@@ -1,4 +1,13 @@
 org 0x7c00
+
+; How much of the disk the boot sector reads in past itself.
+STAGE2_LOAD_MAX equ 32768 - 512
+
+; The installer refuses any disk whose first partition starts before LBA 63 and
+; places stage 2 at byte 4096, so that is all it can ever count on having. That
+; is tighter than STAGE2_LOAD_MAX, so it is what the payload actually has to fit
+; in.
+STAGE2_FIT_MAX equ 63 * 512 - 4096
 bits 16
 
 start:
@@ -43,7 +52,7 @@ start:
     mov ds, si
     mov es, si
     mov ss, si
-    mov sp, 0x7c00
+    mov esp, 0x7c00
     sti
 
     ; Limine isn't made for floppy disks, these are dead anyways.
@@ -71,7 +80,7 @@ start:
     mov eax, dword [di]
     mov ebp, dword [di+4]
     xor bx, bx
-    mov ecx, 32256 ; 32KiB minus boot sector size
+    mov ecx, STAGE2_LOAD_MAX
     call read_sectors
     jc err.4
 
@@ -87,14 +96,6 @@ start:
     mov cr0, eax
 
     jmp 0x08:vector
-
-times 0xda-($-$$) db 0
-times 6 db 0
-
-; Includes
-
-%include 'disk.asm'
-%include '../gdt.asm'
 
 err:
   .4:
@@ -115,6 +116,14 @@ err:
     sti
     .h: hlt
     jmp .h
+
+times 0xda-($-$$) db 0
+times 6 db 0
+
+; Includes
+
+%include 'disk.asm'
+%include '../gdt.asm'
 
 bits 32
 vector:
@@ -151,3 +160,6 @@ stage2:
 %strcat STAGE2_PATH BUILDDIR, '/common-bios/stage2.bin.limlz'
 incbin STAGE2_PATH
 .size: equ $ - stage2
+.fullsize: equ $ - decompressor
+
+times -(stage2.fullsize > STAGE2_FIT_MAX) db 0

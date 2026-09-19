@@ -71,7 +71,9 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
         panic(true, "multiboot1: Executable path not specified");
     }
 
-    print("multiboot1: Loading executable `%#`...\n", kernel_path);
+    if (!terse) {
+        print("multiboot1: Loading executable `%#`...\n", kernel_path);
+    }
 
     if ((kernel_file = uri_open(kernel_path, MEMMAP_KERNEL_AND_MODULES, false
 #if defined (__i386__)
@@ -120,6 +122,11 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
 
     if (header.magic + header.flags + header.checksum)
         panic(true, "multiboot1: Header checksum is invalid");
+
+    // Bits 0-2 are the defined requirements; the rest of 0-15 must be refused.
+    if (header.flags & 0xfff8) {
+        panic(true, "multiboot1: Header requires unsupported features");
+    }
 
     bool section_hdr_info_valid = false;
     struct elf_section_hdr_info section_hdr_info = {0};
@@ -182,14 +189,16 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
 
         switch (bits) {
             case 32:
-                if (!elf32_load_elsewhere(kernel, kernel_file_size, &entry_point, &ranges))
+                if (!elf32_load_elsewhere(kernel, kernel_file_size, 0xffffffff,
+                                          &entry_point, &ranges))
                     panic(true, "multiboot1: ELF32 load failure");
 
                 section_hdr_info = elf32_section_hdr_info(kernel, kernel_file_size);
                 section_hdr_info_valid = true;
                 break;
             case 64: {
-                if (!elf64_load_elsewhere(kernel, kernel_file_size, &entry_point, &ranges))
+                if (!elf64_load_elsewhere(kernel, kernel_file_size, 0xffffffff,
+                                          &entry_point, &ranges))
                     panic(true, "multiboot1: ELF64 load failure");
 
                 section_hdr_info = elf64_section_hdr_info(kernel, kernel_file_size);
@@ -199,6 +208,23 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
             default:
                 panic(true, "multiboot1: Invalid ELF file bitness");
         }
+    }
+
+    // multiboot_reloc_stub reads the range fields with 32-bit loads, so a
+    // target or length it cannot hold is truncated rather than refused.
+    if (ranges->target > 0x100000000
+     || ranges->length > 0xffffffff
+     || ranges->length > 0x100000000 - ranges->target) {
+        panic(true, "multiboot1: Executable does not fit under 4GiB");
+    }
+
+    if (!check_usable_memory(ranges->target, ranges->target + ranges->length)) {
+        panic(true, "multiboot1: Executable load address is not usable memory");
+    }
+
+    if (entry_point < ranges->target
+     || entry_point >= ranges->target + ranges->length) {
+        panic(true, "multiboot1: Entry point is outside the executable");
     }
 
     size_t n_modules;
@@ -277,8 +303,10 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
 
         int bits = elf_bits(kernel, kernel_file_size);
 
-        if ((bits == 64 && section_hdr_info.section_entry_size < sizeof(struct elf64_shdr)) ||
-            (bits == 32 && section_hdr_info.section_entry_size < sizeof(struct elf32_shdr))) {
+        // No sections means no stride to check; the walk below cannot run.
+        if (section_hdr_info.num != 0
+         && ((bits == 64 && section_hdr_info.section_entry_size < sizeof(struct elf64_shdr))
+          || (bits == 32 && section_hdr_info.section_entry_size < sizeof(struct elf32_shdr)))) {
             panic(true, "multiboot1: ELF section entry size too small");
         }
 
@@ -346,7 +374,9 @@ noreturn void multiboot1_load(char *config, char *cmdline) {
             if (module_path == NULL)
                 panic(true, "multiboot1: Module disappeared unexpectedly");
 
-            print("multiboot1: Loading module `%#`...\n", module_path);
+            if (!terse) {
+                print("multiboot1: Loading module `%#`...\n", module_path);
+            }
 
             struct file_handle *f;
             if ((f = uri_open(module_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false
@@ -443,6 +473,8 @@ modeset:;
             fb_init(&fbs, &fbs_count, req_width, req_height, req_bpp, false, false);
             if (fbs_count == 0) {
 #if defined (UEFI)
+                // GRUB warns and boots rather than refusing, and that is what
+                // Multiboot 1 images are written and tested against.
                 goto skip_modeset;
 #elif defined (BIOS)
 textmode:
@@ -484,9 +516,7 @@ textmode:
 skip_modeset:;
 #endif
     } else {
-#if defined (UEFI)
-        panic(true, "multiboot1: Cannot use text mode with UEFI.");
-#elif defined (BIOS)
+#if defined (BIOS)
         vga_textmode_init(false);
 #endif
     }

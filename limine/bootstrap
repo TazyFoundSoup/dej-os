@@ -39,7 +39,7 @@ if ! test -f version; then
     clone_repo_commit \
         https://github.com/osdev0/freestanding-c-hdrs.git \
         freestanding-c-hdrs \
-        097259a899d30f0a4b7a694de2de5fdda942e923
+        38fed4e1e3365733ddbfa03b0a28936243ad31e9
 
     clone_repo_commit \
         https://github.com/osdev0/cc-runtime.git \
@@ -50,24 +50,24 @@ if ! test -f version; then
     clone_repo_commit \
         https://github.com/iczelia/pdgzip.git \
         pdgzip \
-        ce578d3f815bf591b78d1689c09b05acf173c095
+        010197664688f071b923615ea235ecb24963b61a
     cp pdgzip/pdgzip.c common/compress/pdgzip.c
     cp pdgzip/pdgzip.h common/compress/pdgzip.h
 
     clone_repo_commit \
         https://github.com/Limine-Bootloader/limine-protocol.git \
         limine-protocol \
-        630686a3dd3ce40f9e510a7dd9fea6b4c60d952e
+        da65184e91f80fcb397270121b1e2515a11e01ee
 
     clone_repo_commit \
         https://github.com/PicoEFI/PicoEFI.git \
         picoefi \
-        b2578172c650530c95ccd5b7add7f1df8f383eea
+        ca03047ab1edf9772842d1d71950ec442f5b2309
 
     clone_repo_commit \
         https://github.com/Mintsuki/Flanterm.git \
         flanterm \
-        e231edd0e508022521c8233392aabc8ce5c9b242
+        3e311fe2ce4f663273c22d1a229745bc53afa930
 
     clone_repo_commit \
         https://github.com/Mintsuki/stbi-hardened.git \
@@ -86,15 +86,15 @@ fi
 # Create timestamps file
 if test -d .git && git log -1 >/dev/null 2>&1; then
     cat >timestamps <<EOF
-REGEN_DATE="$(git log -1 --pretty=%cd --date='format:%B %Y')"
+REGEN_DATE="$(LC_ALL=C git log -1 --pretty=%cd --date='format:%B %Y')"
 SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
-SOURCE_DATE_EPOCH_TOUCH="$(git log -1 --pretty=%cI | head -c 16 | sed 's/-//g;s/T//g;s/://g')"
+SOURCE_DATE_EPOCH_TOUCH="$(TZ=UTC0 git log -1 --pretty=%cd --date='format-local:%Y%m%d%H%M')"
 EOF
 else
     if ! test -f timestamps; then
         cat >timestamps <<EOF
 REGEN_DATE="UNVERSIONED"
-SOURCE_DATE_EPOCH="1546297200"
+SOURCE_DATE_EPOCH="1546300800"
 SOURCE_DATE_EPOCH_TOUCH="201901010000"
 EOF
     fi

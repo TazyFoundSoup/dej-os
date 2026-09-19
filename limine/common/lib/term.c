@@ -9,6 +9,7 @@
 #include <mm/mtrr.h>
 #include <mm/efi_pt.h>
 #include <drivers/vga_textmode.h>
+#include <lib/gterm.h>
 #include <flanterm_backends/fb.h>
 
 #if defined (BIOS)
@@ -17,6 +18,17 @@ int current_video_mode = -1;
 
 struct flanterm_context **terms = NULL;
 size_t terms_i = 0;
+
+// panic() falls back to this terminal precisely when something has already gone
+// wrong, which includes after allocations have been disallowed, so it cannot be
+// allowed to depend on the allocator.
+static struct flanterm_context fallback_ctx;
+static struct flanterm_context *fallback_terms[1];
+
+#if defined (UEFI)
+// Built while the allocator is live, for panic() to use once it is not.
+static struct flanterm_context *post_ebs_term = NULL;
+#endif
 
 int term_backend = _NOT_READY;
 
@@ -32,10 +44,20 @@ void term_notready(void) {
     for (size_t i = 0; i < terms_i; i++) {
         struct flanterm_context *term = terms[i];
 
+#if defined (UEFI)
+        // Never released: pmm_free panics once allocations are locked out,
+        // which is the state this terminal exists to be usable in.
+        if (term == post_ebs_term) {
+            continue;
+        }
+#endif
+
         term->deinit(term, pmm_free_size_t);
     }
 
-    pmm_free(terms, terms_i * sizeof(void *));
+    if (terms != fallback_terms) {
+        pmm_free(terms, terms_i * sizeof(void *));
+    }
 
     terms_i = 0;
     terms = NULL;
@@ -234,6 +256,58 @@ static bool dummy_handle(void) {
     return true;
 }
 
+#if defined (UEFI)
+void term_prepare_post_ebs(void) {
+    if (post_ebs_term != NULL) {
+        return;
+    }
+
+    // ConOut is gone once boot services are, so the framebuffer is the only
+    // output left. Where writes to it cannot be made to reach memory there is
+    // nothing to fall back to, and a terminal would only cost memory to draw a
+    // message that never appears.
+    if (!fb_flush_reliable()) {
+        return;
+    }
+
+    // The graphical terminal is built on 32-bpp framebuffers only, so taking
+    // the first of those puts the panic on the screen the menu was drawn on.
+    struct fb_info *fb = NULL;
+    for (size_t i = 0; i < fb_fbs_count; i++) {
+        if (fb_fbs[i].framebuffer_bpp == 32) {
+            fb = &fb_fbs[i];
+            break;
+        }
+    }
+
+    if (fb == NULL) {
+        return;
+    }
+
+    // Staged with autoflush off so that building it does not paint the screen.
+    post_ebs_term = flanterm_fb_init(ext_mem_alloc_size_t, pmm_free_size_t,
+        (void *)(uintptr_t)fb->framebuffer_addr, fb->framebuffer_width,
+        fb->framebuffer_height, fb->framebuffer_pitch,
+        fb->red_mask_size, fb->red_mask_shift,
+        fb->green_mask_size, fb->green_mask_shift,
+        fb->blue_mask_size, fb->blue_mask_shift,
+        NULL,
+        NULL, NULL,
+        NULL, NULL,
+        NULL, NULL,
+        NULL, 0, 0, 1,
+        0, 0,
+        0,
+        gterm_get_rotation(NULL),
+        false
+    );
+
+    if (post_ebs_term != NULL) {
+        flanterm_fb_set_flush_callback(post_ebs_term, fb_flush_cb);
+    }
+}
+#endif
+
 void term_fallback(void) {
 #if defined (UEFI)
     int prev_backend = term_backend;
@@ -241,10 +315,9 @@ void term_fallback(void) {
 
     term_notready();
 
-    terms = ext_mem_alloc(sizeof(void *));
+    fallback_terms[0] = &fallback_ctx;
+    terms = fallback_terms;
     terms_i = 1;
-
-    terms[0] = ext_mem_alloc(sizeof(struct flanterm_context));
 
     struct flanterm_context *term = terms[0];
 
@@ -302,34 +375,20 @@ void term_fallback(void) {
         term->set_text_fg_default(term);
         term->set_text_bg_default(term);
     } else {
-        if (fb_fbs_count == 0) {
+        if (post_ebs_term == NULL) {
             goto fail;
         }
 
-        terms[0] = flanterm_fb_init(ext_mem_alloc_size_t, pmm_free_size_t,
-            (void *)(uintptr_t)fb_fbs[0].framebuffer_addr, fb_fbs[0].framebuffer_width,
-            fb_fbs[0].framebuffer_height, fb_fbs[0].framebuffer_pitch,
-            fb_fbs[0].red_mask_size, fb_fbs[0].red_mask_shift,
-            fb_fbs[0].green_mask_size, fb_fbs[0].green_mask_shift,
-            fb_fbs[0].blue_mask_size, fb_fbs[0].blue_mask_shift,
-            NULL,
-            NULL, NULL,
-            NULL, NULL,
-            NULL, NULL,
-            NULL, 0, 0, 1,
-            0, 0,
-            0,
-            FLANTERM_FB_ROTATE_0
-        );
+        terms[0] = post_ebs_term;
+        term_backend = FALLBACK;
 
-        flanterm_fb_set_flush_callback(terms[0], (void *)fb_flush);
+        // Staged with autoflush off, so this is where it is allowed to paint.
+        terms[0]->autoflush = true;
     }
 
     return;
 
 fail:
-    pmm_free(terms[0], sizeof(struct flanterm_context));
-    pmm_free(terms, sizeof(void *));
     terms_i = 0;
     terms = NULL;
 #endif

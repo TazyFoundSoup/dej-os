@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <stdalign.h>
 #include <drivers/disk.h>
+#include <fs/file.h>
 #include <lib/libc.h>
 #if defined (BIOS)
 #  include <lib/real.h>
@@ -206,7 +207,7 @@ static bool detect_sector_size(struct volume *volume) {
     return true;
 }
 
-void disk_create_index(void) {
+void disk_create_index(uint8_t boot_drive) {
     // Disk count (only non-removable) at 0040:0075
     uint8_t bda_disk_count = mminb(rm_desegment(0x0040, 0x0075));
 
@@ -274,7 +275,8 @@ void disk_create_index(void) {
         }
 
         if (!is_removable && !block->is_optical) {
-            if (consumed_bda_disks == bda_disk_count) {
+            // The count can omit the drive the BIOS just booted from, or be 0.
+            if (consumed_bda_disks >= bda_disk_count && drive != boot_drive) {
                 pmm_free(block, sizeof(struct volume));
                 continue;
             }
@@ -291,6 +293,14 @@ void disk_create_index(void) {
 
         if (gpt_get_guid(&block->guid, block)) {
             block->guid_valid = true;
+        }
+
+        // A filesystem occupying the whole medium, as ISO 9660 does, has no
+        // partition volume to carry its label.
+        char *fslabel = fs_get_label(block);
+        if (fslabel != NULL) {
+            block->fslabel_valid = true;
+            block->fslabel = fslabel;
         }
 
         volume_index = pmm_realloc(
@@ -346,11 +356,6 @@ int disk_read_sectors(struct volume *volume, void *buf, uint64_t block, size_t c
 static struct volume *pxe_from_efi_handle(EFI_HANDLE efi_handle) {
     static struct volume *vol = NULL;
 
-    // There's only one PXE volume
-    if (vol) {
-        return vol;
-    }
-
     EFI_STATUS status;
 
     EFI_GUID pxe_base_code_guid = EFI_PXE_BASE_CODE_PROTOCOL_GUID;
@@ -359,6 +364,12 @@ static struct volume *pxe_from_efi_handle(EFI_HANDLE efi_handle) {
     status = gBS->HandleProtocol(efi_handle, &pxe_base_code_guid, (void **)&pxe_base_code);
     if (status) {
         return NULL;
+    }
+
+    // There's only one PXE volume, and it belongs to the handle carrying the
+    // protocol, so the lookup has to gate the reuse.
+    if (vol) {
+        return vol;
     }
 
     if (!pxe_base_code->Mode->DhcpDiscoverValid) {
@@ -652,7 +663,10 @@ struct volume *disk_volume_from_efi_handle(EFI_HANDLE efi_handle) {
         }
     }
 
-    return NULL;
+    // A Block I/O matching no volume does not rule out having booted over the
+    // network from this handle: PXE stacks have been known to leave a
+    // non-functional one behind on it.
+    return pxe_from_efi_handle(efi_handle);
 }
 
 static void find_unique_sectors(void) {
@@ -668,7 +682,7 @@ static void find_unique_sectors(void) {
             continue;
         }
 
-        size_t first_sect = (volume_index[i]->first_sect * 512) / volume_index[i]->sector_size;
+        uint64_t first_sect = (volume_index[i]->first_sect * 512) / volume_index[i]->sector_size;
 
         // sect_count is always in 512-byte sectors
         if (volume_index[i]->sect_count * 512 < UNIQUE_SECTOR_POOL_SIZE) {
@@ -708,6 +722,12 @@ static void find_unique_sectors(void) {
 
 static void find_part_handles(EFI_HANDLE *handles, size_t handle_count) {
     for (size_t i = 0; i < handle_count; i++) {
+        // disk_create_index() clears the handles whose read test failed, and
+        // the unique sector fallback would read 64K more from them.
+        if (handles[i] == NULL) {
+            continue;
+        }
+
         struct volume *vol = disk_volume_from_efi_handle(handles[i]);
         if (vol == NULL) {
             continue;
@@ -856,6 +876,7 @@ fail:
         // Read test to ensure device is responsive (skipping this causes hangs on some systems)
         status = drive->ReadBlocks(drive, drive->Media->MediaId, 0, drive->Media->BlockSize, unique_sector_pool);
         if (status) {
+            handles[i] = NULL;
             continue;
         }
 
@@ -896,6 +917,14 @@ fail:
 
         if (gpt_get_guid(&block->guid, block)) {
             block->guid_valid = true;
+        }
+
+        // A filesystem occupying the whole medium, as ISO 9660 does, has no
+        // partition volume to carry its label.
+        char *fslabel = fs_get_label(block);
+        if (fslabel != NULL) {
+            block->fslabel_valid = true;
+            block->fslabel = fslabel;
         }
 
         volume_index = pmm_realloc(

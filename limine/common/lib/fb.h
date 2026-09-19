@@ -42,6 +42,12 @@ void fb_init(struct fb_info **ret, size_t *_fbs_count,
 
 void fb_clear(struct fb_info *fb);
 
-void fb_flush(volatile void *base, size_t length);
+bool fb_flush_reliable(void);
+
+// False means no mechanism exists, not that a flush was attempted and failed.
+bool fb_flush(volatile void *base, size_t length);
+
+// flanterm's callback type has no return value.
+void fb_flush_cb(volatile void *base, size_t length);
 
 #endif

@@ -323,7 +323,6 @@ static const char *VALID_KEYS[] = {
     "PATH",
     "KERNEL_CMDLINE",
     "KERNEL_PATH",
-    "INITRD_PATH",
     "MODULE_PATH",
     "MODULE_STRING",
     "MODULE_CMDLINE",
@@ -345,6 +344,7 @@ static const char *VALID_KEYS[] = {
     "ENTRY",
     "IF_FW_TYPE",
     "IF_ARCH",
+    "IF_LOADER_ARCH",
     NULL
 };
 
@@ -354,20 +354,21 @@ static int validate_line(const char *buffer) {
     if (!validation_enabled) return TOK_KEY;
     if (buffer[0] == '#')
         return TOK_COMMENT;
-    char keybuf[64];
+    // One past the 64 characters copied, so the terminator always has a home.
+    char keybuf[65];
     size_t i;
     for (i = 0; buffer[i] && i < 64; i++) {
         if (buffer[i] == ':') goto found_equals;
         keybuf[i] = buffer[i];
     }
 fail:
-    if (i < 64) keybuf[i] = 0;
+    keybuf[i] = 0;
     if (keybuf[0] == '\n' || (!keybuf[0] && buffer[0] != ':')) return TOK_KEY; // blank line is valid
     return TOK_BADKEY;
 found_equals:
-    if (i < 64) keybuf[i] = 0;
-    for (i = 0; VALID_KEYS[i]; i++) {
-        if (!strcasecmp(keybuf, VALID_KEYS[i])) {
+    keybuf[i] = 0;
+    for (size_t j = 0; VALID_KEYS[j]; j++) {
+        if (!strcasecmp(keybuf, VALID_KEYS[j])) {
             return TOK_KEY;
         }
     }
@@ -439,7 +440,7 @@ char *config_entry_editor(const char *title, const char *orig_entry) {
     size_t cursor_offset  = 0;
     size_t entry_size     = strlen(orig_entry);
     size_t _window_size   = terms[0]->rows - 7 + (menu_branding[0] == '\0' ? 2 : 0);
-    size_t window_offset  = 0;
+    size_t window_row     = 0;
     size_t line_size      = terms[0]->cols - 2;
 
     // Skip leading newlines
@@ -490,24 +491,25 @@ refresh:
                     set_cursor_pos_helper((terms[0]->cols - branding_len) / 2, y);
                     print("%s%s\e[0m", menu_branding_colour, menu_branding);
                 } else {
+                    size_t keep = max_len > 3 ? max_len - 3 : 0;
                     set_cursor_pos_helper(1, y);
-                    print("%s%S...\e[0m", menu_branding_colour, menu_branding, (size_t)(max_len - 3));
+                    print("%s%S...\e[0m", menu_branding_colour, menu_branding, keep);
                 }
             }
             print("\n\n");
         }
         terms[0]->get_cursor_pos(terms[0], &x, &y);
-        set_cursor_pos_helper((terms[0]->cols - 32) / 2, y);
-        print("%sESC\e[0m Discard and Exit    %sF10\e[0m Boot", interface_help_colour, interface_help_colour);
+        set_cursor_pos_helper((terms[0]->cols > 39) ? (terms[0]->cols - 39) / 2 : 0, y);
+        print("%sESC\e[0m Discard and Exit    %sF10/CTRL+X\e[0m Boot", interface_help_colour, interface_help_colour);
         print("\n\n");
     }
 
-    print(serial ? "/" : "┌");
+    print(SERIAL_CONSOLE ? "/" : "┌");
     for (size_t i = 0; i < terms[0]->cols - 2; i++) {
         switch (i) {
             case 1: case 2: case 3:
-                if (window_offset > 0) {
-                    print(serial ? "^" : "↑");
+                if (window_row > 0) {
+                    print(SERIAL_CONSOLE ? "^" : "↑");
                     break;
                 }
                 // FALLTHRU
@@ -522,13 +524,13 @@ refresh:
                 }
                 if (i == (terms[0]->cols - display_length - 4) / 2) {
                     if (truncated) {
-                        print(serial ? "|%S...|" : "┤%S...├", title, (size_t)(display_length - 3));
+                        print(SERIAL_CONSOLE ? "|%S...|" : "┤%S...├", title, (size_t)(display_length - 3));
                     } else {
-                        print(serial ? "|%s|" : "┤%s├", title);
+                        print(SERIAL_CONSOLE ? "|%s|" : "┤%s├", title);
                     }
                     i += (display_length + 2) - 1;
                 } else {
-                    print(serial ? "-" : "─");
+                    print(SERIAL_CONSOLE ? "-" : "─");
                 }
             }
         }
@@ -536,17 +538,30 @@ refresh:
     size_t tmpx, tmpy;
 
     terms[0]->get_cursor_pos(terms[0], &tmpx, &tmpy);
-    print(serial ? "\\" : "┐");
+    print(SERIAL_CONSOLE ? "\\" : "┐");
     set_cursor_pos_helper(0, tmpy + 1);
-    print(serial ? "|" : "│");
+    print(SERIAL_CONSOLE ? "|" : "│");
 
+    // Always overwritten by the walk below; the compiler cannot prove it.
     size_t cursor_x, cursor_y;
-    size_t current_line = 0, line_offset = 0, window_size = _window_size;
+    terms[0]->get_cursor_pos(terms[0], &cursor_x, &cursor_y);
+    size_t window_end = window_row + _window_size;
+    size_t screen_row = 0, line_offset = 0, cursor_row = 0;
     bool printed_cursor = false;
     bool printed_early = false;
     int token_type = validate_line(buffer);
     size_t tab_space_count = 0;
     for (size_t i = 0; ; i++) {
+        // The window is placed from this row, so the cursor must be taken
+        // where the character starts rather than part way through a tab.
+        if (i == cursor_offset) {
+            cursor_row = screen_row;
+            if (screen_row >= window_row && screen_row < window_end) {
+                terms[0]->get_cursor_pos(terms[0], &cursor_x, &cursor_y);
+                printed_cursor = true;
+            }
+        }
+
         // tab
         if (buffer[i] == '\t') {
             tab_space_count = 8 - (line_offset % 8);
@@ -555,31 +570,26 @@ refresh:
 
         // newline
         if (buffer[i] == '\n'
-         && current_line <  window_offset + window_size
-         && current_line >= window_offset) {
+         && screen_row >= window_row
+         && screen_row < window_end) {
             editor_map_cell(cell_map, i);
             size_t x, y;
             terms[0]->get_cursor_pos(terms[0], &x, &y);
-            if (i == cursor_offset) {
-                cursor_x = x;
-                cursor_y = y;
-                printed_cursor = true;
-            }
             set_cursor_pos_helper(terms[0]->cols - 1, y);
-            if (current_line == window_offset + window_size - 1) {
+            if (screen_row == window_end - 1) {
                 terms[0]->get_cursor_pos(terms[0], &tmpx, &tmpy);
-                print(serial ? "|" : "│");
+                print(SERIAL_CONSOLE ? "|" : "│");
                 set_cursor_pos_helper(0, tmpy + 1);
-                print(serial ? "\\" : "└");
+                print(SERIAL_CONSOLE ? "\\" : "└");
             } else {
                 terms[0]->get_cursor_pos(terms[0], &tmpx, &tmpy);
-                print(serial ? "|" : "│");
+                print(SERIAL_CONSOLE ? "|" : "│");
                 set_cursor_pos_helper(0, tmpy + 1);
-                print(serial ? "|" : "│");
+                print(SERIAL_CONSOLE ? "|" : "│");
             }
             line_offset = 0;
             token_type = validate_line(buffer + i + 1);
-            current_line++;
+            screen_row++;
             continue;
         }
 
@@ -587,118 +597,113 @@ refresh:
         if (token_type == TOK_KEY && buffer[i] == ':') token_type = TOK_EQUALS;
 
 tab_part:
-        if (buffer[i] != 0 && line_offset % line_size == line_size - 1) {
-            if (current_line <  window_offset + window_size
-             && current_line >= window_offset) {
-                if (i == cursor_offset && !printed_cursor) {
-                    terms[0]->get_cursor_pos(terms[0], &cursor_x, &cursor_y);
-                    printed_cursor = true;
-                }
+        // The newline branches end the row; a newline must not wrap it as well.
+        if (buffer[i] != 0 && buffer[i] != '\n'
+         && line_offset % line_size == line_size - 1) {
+            if (screen_row >= window_row && screen_row < window_end) {
                 editor_map_cell(cell_map, i);
                 if (syntax_highlighting_enabled) {
                     putchar_tokencol(token_type, tab_space_count ? ' ' : buffer[i]);
                 } else {
                     print("%c", tab_space_count ? ' ' : buffer[i]);
                 }
-                if (tab_space_count != 0) {
-                    tab_space_count--;
-                }
-                printed_early = true;
                 size_t x, y;
                 terms[0]->get_cursor_pos(terms[0], &x, &y);
                 if (y >= terms[0]->rows - 2) {
-                    print(serial ? ">" : "→");
+                    print(SERIAL_CONSOLE ? ">" : "→");
                     set_cursor_pos_helper(0, y + 1);
-                    print(serial ? "\\" : "└");
+                    print(SERIAL_CONSOLE ? "\\" : "└");
                 } else {
-                    print(serial ? ">" : "→");
+                    print(SERIAL_CONSOLE ? ">" : "→");
                     set_cursor_pos_helper(0, y + 1);
-                    print(serial ? "<" : "←");
+                    print(SERIAL_CONSOLE ? "<" : "←");
                 }
+            } else if (screen_row + 1 == window_row) {
+                // The window can begin partway through a line, so its first row
+                // continues one rather than starting it.
+                size_t x, y;
+                terms[0]->get_cursor_pos(terms[0], &x, &y);
+                set_cursor_pos_helper(0, y);
+                print(SERIAL_CONSOLE ? "<" : "←");
             }
-            if (window_size > 0) {
-                window_size--;
+            if (tab_space_count != 0) {
+                tab_space_count--;
             }
-        }
-
-        if (i == cursor_offset
-         && current_line <  window_offset + window_size
-         && current_line >= window_offset
-         && !printed_cursor) {
-            terms[0]->get_cursor_pos(terms[0], &cursor_x, &cursor_y);
-            printed_cursor = true;
+            printed_early = true;
+            screen_row++;
         }
 
         if (buffer[i] == 0
-         && current_line >= window_offset
-         && current_line < window_offset + window_size) {
+         && screen_row >= window_row
+         && screen_row < window_end) {
             editor_map_cell(cell_map, i);
         }
 
-        if (buffer[i] == 0 || current_line >= window_offset + window_size) {
-            if (!printed_cursor) {
-                if (i <= cursor_offset) {
-                    window_offset++;
-                    goto refresh;
-                }
-                if (i > cursor_offset) {
-                    window_offset--;
-                    goto refresh;
-                }
-            }
+        if (buffer[i] == 0) {
             break;
         }
 
         if (buffer[i] == '\n') {
             line_offset = 0;
             token_type = validate_line(buffer + i + 1);
-            current_line++;
+            screen_row++;
             continue;
         }
 
-        if (current_line >= window_offset) {
-            line_offset++;
-
+        if (!printed_early) {
             // syntax highlighting
-            if (!printed_early) {
+            if (screen_row >= window_row && screen_row < window_end) {
                 editor_map_cell(cell_map, i);
                 if (syntax_highlighting_enabled) {
                     putchar_tokencol(token_type, tab_space_count ? ' ' : buffer[i]);
                 } else {
                     print("%c", tab_space_count ? ' ' : buffer[i]);
                 }
-
-                if (tab_space_count != 0) {
-                    tab_space_count--;
-                }
             }
 
-            printed_early = false;
-
-            // switch to token type 2 after equals sign
-            if (token_type == TOK_EQUALS) token_type = TOK_VALUE;
-
+            if (tab_space_count != 0) {
+                tab_space_count--;
+            }
         }
+
+        printed_early = false;
+        line_offset++;
+
+        // switch to token type 2 after equals sign
+        if (token_type == TOK_EQUALS) token_type = TOK_VALUE;
 
         if (tab_space_count != 0) {
             goto tab_part;
         }
     }
 
-    if (current_line - window_offset < window_size) {
+    // Anchoring the window to a screen row lets it begin partway through a
+    // line; the second pass computes the same anchor, so this cannot repeat.
+    if (!printed_cursor) {
+        size_t anchor = cursor_row;
+        if (cursor_row >= window_end) {
+            anchor = cursor_row - _window_size + 1;
+        }
+        if (anchor != window_row) {
+            window_row = anchor;
+            goto refresh;
+        }
+    }
+
+    if (screen_row - window_row < _window_size) {
         size_t x, y;
-        for (size_t i = 0; i < (window_size - (current_line - window_offset)) - 1; i++) {
+        for (size_t i = 0; i < (_window_size - (screen_row - window_row)) - 1; i++) {
             terms[0]->get_cursor_pos(terms[0], &x, &y);
             set_cursor_pos_helper(terms[0]->cols - 1, y);
-            print(serial ? "|" : "│");
+            print(SERIAL_CONSOLE ? "|" : "│");
             set_cursor_pos_helper(0, y + 1);
-            print(serial ? "|" : "│");
+            print(SERIAL_CONSOLE ? "|" : "│");
         }
         terms[0]->get_cursor_pos(terms[0], &x, &y);
         set_cursor_pos_helper(terms[0]->cols - 1, y);
-        print(serial ? "|" : "│");
+        print(SERIAL_CONSOLE ? "|" : "│");
         set_cursor_pos_helper(0, y + 1);
-        print(serial ? "\\" : "└");
+        print(SERIAL_CONSOLE ? "\\" : "└");
     }
 
     {
@@ -708,26 +713,26 @@ tab_part:
         for (size_t i = 0; i < terms[0]->cols - 2; i++) {
             switch (i) {
                 case 1: case 2: case 3:
-                    if (current_line - window_offset >= window_size) {
-                        print(serial ? "v" : "↓");
+                    if (screen_row - window_row >= _window_size) {
+                        print(SERIAL_CONSOLE ? "v" : "↓");
                         break;
                     }
                     // FALLTHRU
                 default:
                     if (overflow_msg != NULL
                      && i == (terms[0]->cols - overflow_len - 4) / 2) {
-                        print(serial ? "|" : "┤");
+                        print(SERIAL_CONSOLE ? "|" : "┤");
                         print("\e[31m%s\e[0m", overflow_msg);
-                        print(serial ? "|" : "├");
+                        print(SERIAL_CONSOLE ? "|" : "├");
                         i += (overflow_len + 2) - 1;
                     } else {
-                        print(serial ? "-" : "─");
+                        print(SERIAL_CONSOLE ? "-" : "─");
                     }
             }
         }
     }
     terms[0]->get_cursor_pos(terms[0], &tmpx, &tmpy);
-    print(serial ? "/" : "┘");
+    print(SERIAL_CONSOLE ? "/" : "┘");
 
     // Hack to redraw the cursor
     set_cursor_pos_helper(cursor_x, cursor_y);
@@ -738,7 +743,7 @@ tab_part:
 
     int c;
     for (;;) {
-        c = pit_sleep_ms_and_quit_on_input((uint64_t)65535 * 1000, true);
+        c = pit_sleep_ms_and_quit_on_input((uint64_t)65535 * 1000);
         if (c == GETCHAR_MOUSE) {
             struct mouse_state mouse;
             mouse_get_state(&mouse);
@@ -847,6 +852,37 @@ tab_part:
     goto refresh;
 }
 
+// Matches one architecture name against a space separated list of them.
+static bool arch_in_list(const char *list, const char *arch) {
+    while (*list) {
+        const char *end = list;
+        while (*end && !isspace(*end)) {
+            ++end;
+        }
+        if (list == end) {
+            ++list;
+            continue;
+        }
+
+        char buf[16];
+        size_t len = end - list;
+
+        // A name longer than the buffer matches no architecture, so it is
+        // passed over rather than truncated into one that could.
+        if (len < sizeof(buf)) {
+            memcpy(buf, list, len);
+            buf[len] = '\0';
+            if (strcasecmp(buf, arch) == 0) {
+                return true;
+            }
+        }
+
+        list = end;
+    }
+
+    return false;
+}
+
 static inline bool should_skip_entry(struct menu_entry *entry) {
     if (entry->sub != NULL) {
         return false;
@@ -872,35 +908,12 @@ static inline bool should_skip_entry(struct menu_entry *entry) {
         }
     }
     char *cur_entry_if_arch = config_get_value(entry->body, 0, "IF_ARCH");
-    if (cur_entry_if_arch) {
-        const char *arch = current_arch();
-        char *cur_arch = cur_entry_if_arch;
-        bool skip = true;
-        while (*cur_arch) {
-            char *cur_arch_end = cur_arch;
-            while (*cur_arch_end && !isspace(*cur_arch_end)) {
-                ++cur_arch_end;
-            }
-            if (cur_arch == cur_arch_end) {
-                ++cur_arch;
-                continue;
-            }
-            char buf[16];
-            if (cur_arch_end - cur_arch >= 16) {
-                cur_arch = cur_arch_end;
-                continue;
-            }
-            memcpy(buf, cur_arch, cur_arch_end - cur_arch);
-            buf[cur_arch_end - cur_arch] = '\0';
-            if (strcasecmp(buf, arch) == 0) {
-                skip = false;
-                break;
-            }
-            cur_arch = cur_arch_end;
-        }
-        if (skip) {
-            return true;
-        }
+    if (cur_entry_if_arch && !arch_in_list(cur_entry_if_arch, current_arch())) {
+        return true;
+    }
+    char *cur_entry_if_loader_arch = config_get_value(entry->body, 0, "IF_LOADER_ARCH");
+    if (cur_entry_if_loader_arch && !arch_in_list(cur_entry_if_loader_arch, loader_arch())) {
+        return true;
     }
     return false;
 }
@@ -999,6 +1012,133 @@ static void get_entry_path(struct menu_entry *entry, char *buf, size_t buf_size,
         buf[*pos] = '\0';
     }
 }
+
+// systemd takes a boot loader entry identifier only as a filename within
+// [a-zA-Z0-9+_.@-], so the canonical entry path is mapped onto that set:
+// '/' becomes '.', any other byte outside it '-'. Where two entries map to
+// one identifier, the later in menu order gains a "-N" suffix.
+#define BLI_ID_MAX 256
+
+static bool bli_id_char_ok(char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z')
+        || (c >= 'A' && c <= 'Z') || c == '+' || c == '_' || c == '.'
+        || c == '@' || c == '-';
+}
+
+static void bli_entry_base_id(struct menu_entry *entry, char *buf) {
+    char path[MENU_PATH_MAX];
+    size_t pos = 0;
+    get_entry_path(entry, path, sizeof(path), &pos);
+
+    const char *p = path;
+    if (*p == '/') {
+        p++;
+    }
+
+    // Room for the terminator and a duplicate suffix within the filename
+    // length systemd accepts.
+    size_t o = 0;
+    for (; *p != '\0' && o < BLI_ID_MAX - 24; p++) {
+        if (bli_id_char_ok(*p)) {
+            buf[o++] = *p;
+        } else if (*p == '/') {
+            buf[o++] = '.';
+        } else {
+            buf[o++] = '-';
+        }
+    }
+    buf[o] = '\0';
+
+    // A filename may not be empty, `.`, or `..`.
+    if (buf[0] == '\0' || strcmp(buf, ".") == 0 || strcmp(buf, "..") == 0) {
+        buf[o++] = '-';
+        buf[o] = '\0';
+    }
+}
+
+static bool bli_id_dups_before(struct menu_entry *node, struct menu_entry *stop,
+                               const char *base, size_t *dups) {
+    for (; node != NULL; node = node->next) {
+        if (should_skip_entry(node)) {
+            continue;
+        }
+        if (node->sub != NULL) {
+            if (bli_id_dups_before(node->sub, stop, base, dups)) {
+                return true;
+            }
+            continue;
+        }
+        if (node == stop) {
+            return true;
+        }
+        char other[BLI_ID_MAX];
+        bli_entry_base_id(node, other);
+        if (strcmp(other, base) == 0) {
+            (*dups)++;
+        }
+    }
+    return false;
+}
+
+static void bli_entry_id(struct menu_entry *entry, char *buf) {
+    bli_entry_base_id(entry, buf);
+
+    size_t dups = 0;
+    bli_id_dups_before(menu_tree, entry, buf, &dups);
+    if (dups == 0) {
+        return;
+    }
+
+    size_t o = strlen(buf);
+    buf[o++] = '-';
+    char digits[20];
+    size_t ndigits = 0;
+    size_t val = dups + 1;
+    do {
+        digits[ndigits++] = '0' + (val % 10);
+        val /= 10;
+    } while (val > 0);
+    for (size_t i = ndigits; i > 0; i--) {
+        buf[o++] = digits[i - 1];
+    }
+    buf[o] = '\0';
+}
+
+static struct menu_entry *bli_id_to_entry(struct menu_entry *node, const char *id) {
+    for (; node != NULL; node = node->next) {
+        if (should_skip_entry(node)) {
+            continue;
+        }
+        if (node->sub != NULL) {
+            struct menu_entry *found = bli_id_to_entry(node->sub, id);
+            if (found != NULL) {
+                return found;
+            }
+            continue;
+        }
+        char buf[BLI_ID_MAX];
+        bli_entry_id(node, buf);
+        if (strcmp(buf, id) == 0) {
+            return node;
+        }
+    }
+    return NULL;
+}
+
+static void bli_publish_entries_walk(struct menu_entry *node) {
+    for (; node != NULL; node = node->next) {
+        if (should_skip_entry(node)) {
+            continue;
+        }
+        if (node->sub != NULL) {
+            bli_publish_entries_walk(node->sub);
+            continue;
+        }
+        char buf[BLI_ID_MAX];
+        bli_entry_id(node, buf);
+        bli_entries_add(buf);
+    }
+}
 #endif
 
 // Parse one component from an escaped path string.
@@ -1093,14 +1233,14 @@ static bool find_entry_by_path(const char *path, struct menu_entry *current_entr
         bool name_matches = (strcmp(current_entry->name, comp_name) == 0);
 
         if (name_matches && same_name_count == dup_index) {
-            if (is_last && current_entry->sub == NULL) {
+            if (is_last) {
                 *found_entry = current_entry;
                 if (found_index != NULL) {
                     *found_index = idx;
                 }
                 ret = true;
                 break;
-            } else if (!is_last && current_entry->sub != NULL) {
+            } else if (current_entry->sub != NULL) {
                 if (expand_dirs) {
                     current_entry->expanded = true;
                 }
@@ -1125,6 +1265,26 @@ static bool find_entry_by_path(const char *path, struct menu_entry *current_entr
     pmm_free(comp_name, strlen(comp_name) + 1);
     return ret;
 }
+
+#if defined (UEFI)
+// A LoaderEntries identifier names the entry; a path is also accepted, as
+// an older LoaderEntryDefault in NVRAM can hold one.
+static void find_entry_by_bli_id_or_path(const char *str,
+                                         struct menu_entry **found_entry,
+                                         size_t *found_index) {
+    struct menu_entry *entry = bli_id_to_entry(menu_tree, str);
+    if (entry != NULL) {
+        char path[MENU_PATH_MAX];
+        size_t pos = 0;
+        get_entry_path(entry, path, sizeof(path), &pos);
+        find_entry_by_path(path, menu_tree, 0, found_entry, found_index, true);
+        if (*found_entry != NULL) {
+            return;
+        }
+    }
+    find_entry_by_path(str, menu_tree, 0, found_entry, found_index, true);
+}
+#endif
 
 static size_t print_tree(size_t offset, size_t window, const char *shift, size_t level, size_t base_index, size_t selected_entry,
                       struct menu_entry *current_entry,
@@ -1170,23 +1330,23 @@ static size_t print_tree(size_t offset, size_t window, const char *shift, size_t
                 for (size_t j = 0; j < i; j++)
                     actual_parent = actual_parent->parent;
                 if (actual_parent->next != NULL) {
-                    if (!no_print) print(serial ? " |" : " │");
+                    if (!no_print) print(SERIAL_CONSOLE ? " |" : " │");
                 } else {
                     if (!no_print) print("  ");
                 }
                 cur_len += 2;
             }
             if (current_entry->next == NULL) {
-                if (!no_print) print(serial ? " `" : " └");
+                if (!no_print) print(SERIAL_CONSOLE ? " `" : " └");
             } else {
-                if (!no_print) print(serial ? " |" : " ├");
+                if (!no_print) print(SERIAL_CONSOLE ? " |" : " ├");
             }
             cur_len += 2;
         }
         if (current_entry->sub) {
             if (!no_print) print(current_entry->expanded ? "[-]" : "[+]");
         } else if (level) {
-            if (!no_print) print(serial ? "-->" : "──►");
+            if (!no_print) print(SERIAL_CONSOLE ? "-->" : "──►");
         } else {
             if (!no_print) print("   ");
         }
@@ -1272,6 +1432,17 @@ static void menu_init_term(void) {
         if (!quiet) {
             vga_textmode_init(true);
         }
+#endif
+    }
+
+    // Terminal too small for menu, fall back to text console. Checked here so
+    // that a later re-init cannot re-establish a size the menu cannot draw.
+    if (!quiet && (terms[0]->cols < 40 || terms[0]->rows < 16)) {
+#if defined (BIOS)
+        vga_textmode_init(true);
+#elif defined (UEFI)
+        serial = true;
+        term_fallback();
 #endif
     }
 }
@@ -1414,8 +1585,9 @@ static void print_entry_comment(const struct menu_entry *entry, size_t row) {
         set_cursor_pos_helper((terms[0]->cols - comment_len) / 2, row);
         print("\e[36m%s\e[0m", entry->comment);
     } else {
+        size_t keep = max_len > 3 ? max_len - 3 : 0;
         set_cursor_pos_helper(1, row);
-        print("\e[36m%S...\e[0m", entry->comment, (size_t)(max_len - 3));
+        print("\e[36m%S...\e[0m", entry->comment, keep);
     }
     FOR_TERM(TERM->scroll_enabled = true);
 }
@@ -1489,6 +1661,9 @@ noreturn void _menu(bool first_run) {
     char *verbose_str = config_get_value(NULL, 0, "VERBOSE");
     verbose = verbose_str != NULL && strcmp(verbose_str, "yes") == 0;
 
+    char *terse_str = config_get_value(NULL, 0, "TERSE");
+    terse = terse_str != NULL && strcmp(terse_str, "yes") == 0;
+
     char *serial_str = config_get_value(NULL, 0, "SERIAL");
     serial =
 #if defined (UEFI)
@@ -1506,17 +1681,26 @@ noreturn void _menu(bool first_run) {
 #endif
 
 #if defined (BIOS)
-    if (serial) {
+    {
+        // The driver also transmits for a COM_OUTPUT build, which never sets
+        // serial, so the rate has to be read whatever selected the output.
         char *baudrate_s = config_get_value(NULL, 0, "SERIAL_BAUDRATE");
         if (baudrate_s == NULL) {
             serial_baudrate = 115200;
         } else {
-            serial_baudrate = strtoui(baudrate_s, NULL, 10);
-            if (serial_baudrate == 0 || serial_baudrate > 115200) {
-                serial_baudrate = 115200;
+            // A rate the clock does not divide exactly programs a different
+            // one; 50 is the slowest standard rate and bounds the wait.
+            uint64_t baudrate = strtoui(baudrate_s, NULL, 10);
+            if (baudrate < 50 || baudrate > 115200 || 115200 % baudrate != 0) {
+                baudrate = 115200;
             }
+            serial_baudrate = baudrate;
         }
     }
+
+    // serial also picks the terminal's row budget and the menu's glyphs, so the
+    // port is settled here rather than lazily at whatever prints first.
+    serial_initialise();
 #endif
 
     char *hash_mismatch_panic_str = config_get_value(NULL, 0, "HASH_MISMATCH_PANIC");
@@ -1657,15 +1841,20 @@ noreturn void _menu(bool first_run) {
     size_t selected_entry = 0;
 
     bool has_entry = false;
+    bool default_entry_unresolved = false;
 
 #if defined (UEFI)
+    bli_entries_reset();
+    bli_publish_entries_walk(menu_tree);
+    bli_entries_publish();
+
     {
         char path[MENU_PATH_MAX];
         if (bli_get_oneshot_entry(path, MENU_PATH_MAX)) {
-            // Find the entry with this path, expand directories, and get its index.
+            // Find the entry, expand directories, and get its index.
             struct menu_entry *found_entry = NULL;
             size_t found_index = 0;
-            find_entry_by_path(path, menu_tree, 0, &found_entry, &found_index, true);
+            find_entry_by_bli_id_or_path(path, &found_entry, &found_index);
             if (found_entry != NULL) {
                 selected_entry = found_index;
                 has_entry = true;
@@ -1674,9 +1863,38 @@ noreturn void _menu(bool first_run) {
     }
 #endif
 
+#if defined (UEFI)
+    if (!has_entry) {
+        char *remember_last = config_get_value(NULL, 0, "REMEMBER_LAST_ENTRY");
+        if (remember_last != NULL && strcasecmp(remember_last, "yes") == 0) {
+            char last_entry_path[MENU_PATH_MAX];
+            UINTN getvar_size = sizeof(last_entry_path);
+            if (gRT->GetVariable(L"LimineLastBootedEntry",
+                                 &limine_efi_vendor_guid,
+                                 NULL,
+                                 &getvar_size,
+                                 last_entry_path) == 0 && getvar_size > 0) {
+                // Ensure NUL termination
+                last_entry_path[getvar_size < sizeof(last_entry_path) ? getvar_size : sizeof(last_entry_path) - 1] = '\0';
+                // Find the entry with this path, expand directories, and get its index.
+                struct menu_entry *found_entry = NULL;
+                size_t found_index = 0;
+                find_entry_by_path(last_entry_path, menu_tree, 0, &found_entry, &found_index, true);
+                if (found_entry != NULL) {
+                    selected_entry = found_index;
+                    has_entry = true;
+                }
+            }
+        }
+    }
+#endif
+
     if (!has_entry) {
         char *default_entry = config_get_value(NULL, 0, "DEFAULT_ENTRY");
         if (default_entry != NULL) {
+            // A present but unusable value still counts as set, so
+            // LoaderEntryDefault cannot stand in for it.
+            has_entry = true;
             bool is_index = true;
             for (const char *p = default_entry; *p != '\0'; p++) {
                 if (*p < '0' || *p > '9') {
@@ -1703,6 +1921,10 @@ noreturn void _menu(bool first_run) {
                 find_entry_by_path(default_entry_path, menu_tree, 0, &found_entry, &found_index, true);
                 if (found_entry != NULL) {
                     selected_entry = found_index;
+                } else {
+                    // Index 0 is a valid entry, so an unresolved path is
+                    // otherwise indistinguishable from one naming the first.
+                    default_entry_unresolved = true;
                 }
             }
         }
@@ -1710,35 +1932,12 @@ noreturn void _menu(bool first_run) {
 
 #if defined (UEFI)
     if (!has_entry) {
-        char *remember_last = config_get_value(NULL, 0, "REMEMBER_LAST_ENTRY");
-        if (remember_last != NULL && strcasecmp(remember_last, "yes") == 0) {
-            char last_entry_path[MENU_PATH_MAX];
-            UINTN getvar_size = sizeof(last_entry_path);
-            if (gRT->GetVariable(L"LimineLastBootedEntry",
-                                 &limine_efi_vendor_guid,
-                                 NULL,
-                                 &getvar_size,
-                                 last_entry_path) == 0 && getvar_size > 0) {
-                // Ensure NUL termination
-                last_entry_path[getvar_size < sizeof(last_entry_path) ? getvar_size : sizeof(last_entry_path) - 1] = '\0';
-                // Find the entry with this path, expand directories, and get its index.
-                struct menu_entry *found_entry = NULL;
-                size_t found_index = 0;
-                find_entry_by_path(last_entry_path, menu_tree, 0, &found_entry, &found_index, true);
-                if (found_entry != NULL) {
-                    selected_entry = found_index;
-                    has_entry = true;
-                }
-            }
-        }
-    }
-    if (!has_entry) {
         char path[MENU_PATH_MAX];
         if (bli_get_default_entry(path, MENU_PATH_MAX)) {
-            // Find the entry with this path, expand directories, and get its index.
+            // Find the entry, expand directories, and get its index.
             struct menu_entry *found_entry = NULL;
             size_t found_index = 0;
-            find_entry_by_path(path, menu_tree, 0, &found_entry, &found_index, true);
+            find_entry_by_bli_id_or_path(path, &found_entry, &found_index);
             if (found_entry != NULL) {
                 selected_entry = found_index;
                 has_entry = true;
@@ -1754,16 +1953,12 @@ noreturn void _menu(bool first_run) {
         selected_entry = 0;
     }
 
-    size_t timeout = 5;
-    uint64_t timeout_ms = timeout * 1000;
+    uint64_t timeout_ms = 5000;
 
     bool has_timeout = false;
 
 #if defined (UEFI)
-    has_timeout = bli_update_oneshot_timeout(&timeout, &skip_timeout);
-    if (has_timeout) {
-        timeout_ms = (uint64_t)timeout * 1000;
-    }
+    has_timeout = bli_update_oneshot_timeout(&timeout_ms, &skip_timeout);
 #endif
 
     if (!has_timeout) {
@@ -1779,8 +1974,7 @@ noreturn void _menu(bool first_run) {
 
 #if defined (UEFI)
     if (!has_timeout) {
-        has_timeout = bli_update_timeout(&timeout, &skip_timeout);
-        timeout_ms = (uint64_t)timeout * 1000;
+        has_timeout = bli_update_timeout(&timeout_ms, &skip_timeout);
     }
 #endif
 
@@ -1797,27 +1991,22 @@ noreturn void _menu(bool first_run) {
         skip_timeout = true;
     }
 
-    if (!skip_timeout && !timeout_ms) {
-        if (max_entries == 0 || selected_menu_entry == NULL || selected_menu_entry->sub != NULL) {
+    if (!skip_timeout) {
+        if (default_entry_unresolved || max_entries == 0
+         || selected_menu_entry == NULL) {
             quiet = false;
-            print("Default entry is not valid or directory, booting to menu.\n");
+            print("Default entry is not valid, booting to menu.\n");
             skip_timeout = true;
-        } else {
+        } else if (selected_menu_entry->sub != NULL) {
+            // Selecting a directory is not an error; it just cannot be booted.
+            quiet = false;
+            skip_timeout = true;
+        } else if (!timeout_ms) {
             goto autoboot;
         }
     }
 
     menu_init_term();
-
-    if (terms[0]->cols < 40 || terms[0]->rows < 16) {
-        // Terminal too small for menu, fall back to text console
-#if defined (BIOS)
-        vga_textmode_init(true);
-#elif defined (UEFI)
-        serial = true;
-        term_fallback();
-#endif
-    }
 
     if (!quiet) {
         mouse_init();
@@ -1861,8 +2050,9 @@ refresh:
                     set_cursor_pos_helper((terms[0]->cols - branding_len) / 2, y);
                     print("%s%s\e[0m", menu_branding_colour, menu_branding);
                 } else {
+                    size_t keep = max_len > 3 ? max_len - 3 : 0;
                     set_cursor_pos_helper(1, y);
-                    print("%s%S...\e[0m", menu_branding_colour, menu_branding, (size_t)(max_len - 3));
+                    print("%s%S...\e[0m", menu_branding_colour, menu_branding, keep);
                 }
             }
             print("\n\n\n\n");
@@ -1917,12 +2107,12 @@ refresh:
         if (max_entries != 0) {
             if (tree_offset > 0) {
                 set_cursor_pos_helper((terms[0]->cols - 3) / 2, 3 + header_offset);
-                print(serial ? "^^^" : "↑↑↑");
+                print(SERIAL_CONSOLE ? "^^^" : "↑↑↑");
             }
 
             if (tree_offset + (terms[0]->rows - 8 - header_offset) < max_entries) {
                 set_cursor_pos_helper((terms[0]->cols - 3) / 2, terms[0]->rows - 4);
-                print(serial ? "vvv" : "↓↓↓");
+                print(SERIAL_CONSOLE ? "vvv" : "↓↓↓");
             }
         }
 
@@ -1985,14 +2175,8 @@ refresh:
                 sleep_ms = 1000;
             }
 
-            // Mouse movement only moves the pointer, it doesn't change selection;
-            // or stop the timeout.
-            if ((c = pit_sleep_ms_and_quit_on_input(sleep_ms, false))) {
+            if ((c = pit_sleep_ms_and_quit_on_input(sleep_ms))) {
                 skip_timeout = true;
-                if (c == GETCHAR_MOUSE) {
-                    // Drop the click.
-                    mouse_flush();
-                }
                 if (quiet) {
                     quiet = false;
                     menu_init_term();
@@ -2024,7 +2208,7 @@ refresh:
     mouse_render_pointer();
 
     for (;;) {
-        c = pit_sleep_ms_and_quit_on_input((uint64_t)65535 * 1000, true);
+        c = pit_sleep_ms_and_quit_on_input((uint64_t)65535 * 1000);
         if (c == 0) {
             continue;
         }
@@ -2150,7 +2334,10 @@ timeout_aborted:
                                  EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
                                  strlen(entry_path) + 1,
                                  entry_path);
-                bli_set_selected_entry(entry_path);
+
+                char entry_id[BLI_ID_MAX];
+                bli_entry_id(selected_menu_entry, entry_id);
+                bli_set_selected_entry(entry_id);
 #endif
 
                 boot(selected_menu_entry->body);

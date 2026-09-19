@@ -62,7 +62,6 @@ void ap_entry(struct limine_mp_info *cpu){
         default: cpu_stop();
     }
 
-ret:
     printf("core %ul returned halting on core\n", percpu_read(cpu_id));
     percpu_write(sil, 10);
     percpu_write(cpu_state, 0x1);

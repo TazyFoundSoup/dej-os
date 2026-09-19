@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <lib/misc.h>
+#include <sys/cpu.h>
 #include <lib/libc.h>
 #include <lib/pe.h>
 #include <lib/print.h>
@@ -173,6 +174,11 @@ static void pe64_validate(uint8_t *image, size_t file_size) {
         panic(true, "pe: e_lfanew offset out of bounds");
     }
 
+    // The PE layout puts the header on an 8-byte boundary.
+    if (dos_hdr->e_lfanew % 8 != 0) {
+        panic(true, "pe: NT headers are not aligned in the file");
+    }
+
     IMAGE_NT_HEADERS64 *nt_hdrs = (IMAGE_NT_HEADERS64 *)(image + dos_hdr->e_lfanew);
 
     if (nt_hdrs->Signature != IMAGE_NT_SIGNATURE) {
@@ -227,6 +233,10 @@ int pe_bits(uint8_t *image, size_t image_size) {
         return -1;
     }
 
+    if (dos_hdr->e_lfanew % 8 != 0) {
+        return -1;
+    }
+
     IMAGE_NT_HEADERS64 *nt_hdrs = (IMAGE_NT_HEADERS64 *)(image + dos_hdr->e_lfanew);
 
     if (nt_hdrs->Signature != IMAGE_NT_SIGNATURE) {
@@ -246,6 +256,27 @@ int pe_bits(uint8_t *image, size_t image_size) {
     return -1;
 }
 
+// A relocation's target alignment is the image's to choose, and a wide
+// unaligned access may trap on riscv64 and loongarch64.
+static uint64_t reloc_load(const void *p, size_t size) {
+    const volatile uint8_t *s = p;
+    uint64_t v = 0;
+
+    for (size_t i = 0; i < size; i++) {
+        v |= (uint64_t)s[i] << (i * 8);
+    }
+
+    return v;
+}
+
+static void reloc_store(void *p, uint64_t v, size_t size) {
+    volatile uint8_t *d = p;
+
+    for (size_t i = 0; i < size; i++) {
+        d[i] = (uint8_t)(v >> (i * 8));
+    }
+}
+
 bool pe64_load(uint8_t *image, size_t file_size, uint64_t *entry_point, uint64_t *_slide, uint32_t alloc_type, bool kaslr, struct mem_range **_ranges, uint64_t *_ranges_count, uint64_t *physical_base, uint64_t *virtual_base, uint64_t *_image_size, uint64_t *image_size_before_bss, bool *_is_reloc) {
     pe64_validate(image, file_size);
 
@@ -257,6 +288,14 @@ bool pe64_load(uint8_t *image, size_t file_size, uint64_t *entry_point, uint64_t
     uint64_t sections_end = sections_offset + (uint64_t)nt_hdrs->FileHeader.NumberOfSections * sizeof(IMAGE_SECTION_HEADER);
     if (sections_end > file_size) {
         panic(true, "pe: Section headers extend beyond file bounds");
+    }
+
+    if (sections_offset % 4 != 0) {
+        panic(true, "pe: Section headers are not aligned in the file");
+    }
+
+    if (nt_hdrs->FileHeader.NumberOfSections == 0) {
+        panic(true, "pe: Executable has no sections");
     }
 
     IMAGE_SECTION_HEADER *sections = (IMAGE_SECTION_HEADER *)((uintptr_t)&nt_hdrs->OptionalHeader + nt_hdrs->FileHeader.SizeOfOptionalHeader);
@@ -281,6 +320,12 @@ bool pe64_load(uint8_t *image, size_t file_size, uint64_t *entry_point, uint64_t
 
     if (alignment > 1 && (alignment & (alignment - 1)) != 0) {
         panic(true, "pe: SectionAlignment is not a power of 2");
+    }
+
+    // Permissions are applied per section but mapped a page at a time, so
+    // sections sharing a page could demand conflicting ones.
+    if (alignment < 0x1000) {
+        panic(true, "pe: SectionAlignment is below the page size");
     }
 
     bool lower_to_higher = false;
@@ -328,6 +373,8 @@ again:
         }
     }
 
+    uint64_t prev_section_top = 0;
+
     for (size_t i = 0; i < nt_hdrs->FileHeader.NumberOfSections; i++) {
         IMAGE_SECTION_HEADER *section = &sections[i];
 
@@ -345,12 +392,35 @@ again:
             panic(true, "pe: Section %U virtual size exceeds image bounds", (uint64_t)i);
         }
 
+        // The PE specification has section VAs ascending and adjacent, so one
+        // starting below the previous top would overwrite it once copied.
+        if ((uint64_t)section->VirtualAddress < prev_section_top) {
+            panic(true, "pe: Section %U overlaps or is out of order", (uint64_t)i);
+        }
+
+        prev_section_top = (uint64_t)section->VirtualAddress + section->VirtualSize;
+
+        if (section->VirtualAddress % alignment != 0) {
+            panic(true, "pe: Section %U is not aligned to SectionAlignment", (uint64_t)i);
+        }
+
         // Validate section data doesn't exceed file bounds
         if ((uint64_t)section->PointerToRawData + section_raw_size > file_size) {
             panic(true, "pe: Section %U data extends beyond file bounds", (uint64_t)i);
         }
 
         memcpy((void *)section_base, image + section->PointerToRawData, section_raw_size);
+    }
+
+    // Unless a section covers them, the headers get a read-only range of their
+    // own, so their pages have to end before the first section begins.
+    if (sections[0].VirtualAddress != 0) {
+        uint64_t headers_top = ALIGN_UP((uint64_t)nt_hdrs->OptionalHeader.SizeOfHeaders,
+                                        0x1000, panic(true, "pe: Alignment overflow"));
+
+        if (headers_top > sections[0].VirtualAddress) {
+            panic(true, "pe: Headers overlap the first section");
+        }
     }
 
     if (nt_hdrs->OptionalHeader.NumberOfRvaAndSizes < IMAGE_DIRECTORY_ENTRY_BASERELOC + 1) {
@@ -365,6 +435,11 @@ again:
             sizeof(IMAGE_IMPORT_DESCRIPTOR) > image_size - import_dir->VirtualAddress) {
             panic(true, "pe: Import directory VirtualAddress out of bounds");
         }
+
+        if (import_dir->VirtualAddress % 4 != 0) {
+            panic(true, "pe: Import directory is not aligned in the image");
+        }
+
         IMAGE_IMPORT_DESCRIPTOR *import_desc = (IMAGE_IMPORT_DESCRIPTOR *)((uintptr_t)*physical_base + import_dir->VirtualAddress);
 
         if (import_desc->Name != 0) {
@@ -380,23 +455,33 @@ again:
         size_t reloc_block_offset = 0;
 
         while (reloc_dir->Size - reloc_block_offset >= sizeof(IMAGE_BASE_RELOCATION_BLOCK)) {
+            // Each base relocation block must start on a 32-bit boundary.
+            if (((uint64_t)reloc_dir->VirtualAddress + reloc_block_offset) % 4 != 0) {
+                panic(true, "pe: Relocation block is not aligned in the image");
+            }
+
             IMAGE_BASE_RELOCATION_BLOCK *block = (IMAGE_BASE_RELOCATION_BLOCK *)((uintptr_t)*physical_base + reloc_dir->VirtualAddress + reloc_block_offset);
 
+            // The block header lives in the image these relocations write to,
+            // where the directory above does not, so its fields are taken once.
+            uint32_t block_va = block->VirtualAddress;
+            uint32_t block_size = block->SizeOfBlock;
+
             // Validate SizeOfBlock to prevent infinite loop (if 0) and underflow (if too small)
-            if (block->SizeOfBlock < sizeof(IMAGE_BASE_RELOCATION_BLOCK)) {
+            if (block_size < sizeof(IMAGE_BASE_RELOCATION_BLOCK)) {
                 panic(true, "pe: Invalid relocation block size");
             }
 
-            if (block->SizeOfBlock > reloc_dir->Size - reloc_block_offset) {
+            if (block_size > reloc_dir->Size - reloc_block_offset) {
                 panic(true, "pe: Relocation block size exceeds directory");
             }
 
-            if (block->VirtualAddress >= image_size) {
+            if (block_va >= image_size) {
                 panic(true, "pe: Relocation block VirtualAddress out of bounds");
             }
 
-            uintptr_t block_base = *physical_base + block->VirtualAddress;
-            size_t entries = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION_BLOCK)) / sizeof(uint16_t);
+            uintptr_t block_base = *physical_base + block_va;
+            size_t entries = (block_size - sizeof(IMAGE_BASE_RELOCATION_BLOCK)) / sizeof(uint16_t);
             uint16_t *relocs = (uint16_t *)(block + 1);
 
             for (size_t i = 0; i < entries; i++) {
@@ -420,23 +505,20 @@ again:
                         panic(true, "pe: Unsupported relocation type %u", type);
                 }
 
-                if ((uint64_t)block->VirtualAddress + offset + write_size > image_size) {
+                if ((uint64_t)block_va + offset + write_size > image_size) {
                     panic(true, "pe: Relocation offset out of bounds");
                 }
 
-                switch (type) {
-                    case IMAGE_REL_BASED_HIGHLOW:
-                        *(uint32_t *)(block_base + offset) += slide;
-                        break;
-                    case IMAGE_REL_BASED_DIR64:
-                        *(uint64_t *)(block_base + offset) += slide;
-                        break;
-                }
+                void *ptr = (void *)(block_base + offset);
+
+                reloc_store(ptr, reloc_load(ptr, write_size) + slide, write_size);
             }
 
-            reloc_block_offset += block->SizeOfBlock;
+            reloc_block_offset += block_size;
         }
     }
+
+    sync_icache_range((uintptr_t)*physical_base, (uintptr_t)*physical_base + image_size);
 
     if (image_size_before_bss) {
         *image_size_before_bss = image_size;
@@ -475,21 +557,36 @@ again:
 
         size_t range_index = 0;
 
+        // A range rounded past SizeOfImage maps memory the image does not own,
+        // and ImageBase can wrap those addresses, so the clamp compares lengths.
+        uint64_t image_extent = ALIGN_UP(image_size, 0x1000, panic(true, "pe: Alignment overflow"));
+        uint64_t image_top = CHECKED_ADD(*virtual_base, image_extent,
+            panic(true, "pe: Image extends past the address space"));
+
         if (!headers_within_section) {
             struct mem_range *range = &ranges[range_index++];
             range->base = *virtual_base;
             range->length = ALIGN_UP(nt_hdrs->OptionalHeader.SizeOfHeaders, 0x1000, panic(true, "pe: Alignment overflow"));
+
+            if (range->length > image_top - range->base) {
+                range->length = image_top - range->base;
+            }
+
             range->permissions = MEM_RANGE_R;
         }
 
         for (size_t i = 0; i < nt_hdrs->FileHeader.NumberOfSections; i++) {
             IMAGE_SECTION_HEADER *section = &sections[i];
 
-            uintptr_t misalign = section->VirtualAddress % alignment;
-
             struct mem_range *range = &ranges[range_index++];
-            range->base = *virtual_base + ALIGN_DOWN(section->VirtualAddress, alignment);
-            range->length = ALIGN_UP(section->VirtualSize + misalign, alignment, panic(true, "pe: Alignment overflow"));
+            range->base = *virtual_base + section->VirtualAddress;
+            // ALIGN_UP accumulates in its first argument's type, so the cast
+            // is what keeps a section rounding up past 4 GiB from truncating.
+            range->length = ALIGN_UP((uint64_t)section->VirtualSize, alignment, panic(true, "pe: Alignment overflow"));
+
+            if (range->length > image_top - range->base) {
+                range->length = image_top - range->base;
+            }
 
             if (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) {
                 range->permissions |= MEM_RANGE_X;

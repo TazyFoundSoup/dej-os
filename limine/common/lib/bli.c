@@ -106,71 +106,136 @@ void init_bli(void) {
             sizeof(features),
             &features);
 
-    char part_uuid_str[37];
-    guid_to_string(&boot_volume->part_guid, part_uuid_str);
+    if (boot_volume->part_guid_valid) {
+        char part_uuid_str[37];
+        guid_to_string(&boot_volume->part_guid, part_uuid_str);
 
-    // Convert part_uuid_str to a wide-char string
-    wchar_t part_uuid[37];
-    for (size_t i = 0; i < 37; i++) {
-        part_uuid[i] = (wchar_t) part_uuid_str[i];
+        // Convert part_uuid_str to a wide-char string
+        wchar_t part_uuid[37];
+        for (size_t i = 0; i < 37; i++) {
+            part_uuid[i] = (wchar_t) part_uuid_str[i];
+        }
+
+        gRT->SetVariable(L"LoaderDevicePartUUID",
+                &bli_vendor_guid,
+                EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+                sizeof(part_uuid),
+                part_uuid);
     }
-
-    gRT->SetVariable(L"LoaderDevicePartUUID",
-            &bli_vendor_guid,
-            EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
-            sizeof(part_uuid),
-            part_uuid);
 }
 
 void bli_on_boot(void) {
     bli_set_loader_time(L"LoaderTimeExecUSec", rdtsc_usec());
 }
 
-static bool handle_timeout(wchar_t *variable, bool erase, size_t *timeout, bool *skip_timeout) {
+// menu-hidden boots the default entry with the menu suppressed, but the
+// interface still wants a key to be able to summon the menu "for a brief
+// moment" before the boot; this window is that moment.
+#define MENU_HIDDEN_TIMEOUT_MS 500
+
+// True whenever the variable held a policy: a consumed value must not fall
+// through to the sources a set one-shot variable is defined to override.
+static bool handle_timeout(wchar_t *variable, bool erase, uint64_t *timeout_ms, bool *skip_timeout) {
     wchar_t timeout_buf[256];
     UINTN getvar_size = sizeof(timeout_buf) - 2;
     uint32_t attrs;
+
     if (gRT->GetVariable(variable,
                              &bli_vendor_guid,
                              &attrs,
                              &getvar_size,
-                             timeout_buf) == 0 && getvar_size > 0) {
-        if (erase) {
-            gRT->SetVariable(variable, &bli_vendor_guid,
-                attrs,
-                0, NULL);
-        }
-        if (getvar_size == 22 && memcmp(timeout_buf, L"menu-force", 22) == 0) {
-            *skip_timeout = true;
-            return true;
-        }
-        if ((getvar_size == 24 && memcmp(timeout_buf, L"menu-hidden",24) == 0) || (getvar_size == 28 && memcmp(timeout_buf, L"menu-disabled",28) == 0)) {
-            // TODO: menu-hidden should enable quiet & set timeout >= 1
-            *timeout = 0;
-            return true;
-        }
-        size_t t;
-        if (!decwstr_to_size(timeout_buf, getvar_size, &t)) {
-            return false;
-        }
-        // For LoaderConfigTimeoutOneShot, "0" means show menu indefinitely.
-        if (erase && t == 0) {
-            *skip_timeout = true;
-            return true;
-        }
-        *timeout = t;
+                             timeout_buf) != 0 || getvar_size == 0) {
+        return false;
+    }
+
+    if (erase) {
+        gRT->SetVariable(variable, &bli_vendor_guid,
+            attrs,
+            0, NULL);
+    }
+
+    if (getvar_size == 22 && memcmp(timeout_buf, L"menu-force", 22) == 0) {
+        *skip_timeout = true;
         return true;
     }
-    return false;
 
+    if (getvar_size == 24 && memcmp(timeout_buf, L"menu-hidden", 24) == 0) {
+        quiet = true;
+        *timeout_ms = MENU_HIDDEN_TIMEOUT_MS;
+        return true;
+    }
+
+    if (getvar_size == 28 && memcmp(timeout_buf, L"menu-disabled", 28) == 0) {
+        *timeout_ms = 0;
+        return true;
+    }
+
+    size_t t;
+    if (!decwstr_to_size(timeout_buf, getvar_size, &t)) {
+        return false;
+    }
+
+    if (t == 0) {
+        // Zero turns a one-shot timeout off outright; a persistent zero is
+        // menu-hidden.
+        if (erase) {
+            *skip_timeout = true;
+        } else {
+            quiet = true;
+            *timeout_ms = MENU_HIDDEN_TIMEOUT_MS;
+        }
+        return true;
+    }
+
+    uint64_t seconds = t;
+    if (seconds > UINT64_MAX / 1000) {
+        seconds = UINT64_MAX / 1000;
+    }
+    *timeout_ms = seconds * 1000;
+    return true;
 }
 
-bool bli_update_oneshot_timeout(size_t *timeout, bool *skip_timeout) {
-    return handle_timeout(L"LoaderConfigTimeoutOneShot", true, timeout, skip_timeout);
+bool bli_update_oneshot_timeout(uint64_t *timeout_ms, bool *skip_timeout) {
+    return handle_timeout(L"LoaderConfigTimeoutOneShot", true, timeout_ms, skip_timeout);
 }
 
-bool bli_update_timeout(size_t *timeout, bool *skip_timeout) {
-    return handle_timeout(L"LoaderConfigTimeout", false, timeout, skip_timeout);
+bool bli_update_timeout(uint64_t *timeout_ms, bool *skip_timeout) {
+    return handle_timeout(L"LoaderConfigTimeout", false, timeout_ms, skip_timeout);
+}
+
+// The identifiers menu.c derives, one after the other, each NUL terminated,
+// in menu order, as the interface has LoaderEntries carry them.
+static wchar_t loader_entries[2048];
+static size_t loader_entries_len = 0;
+static bool loader_entries_full = false;
+
+void bli_entries_reset(void) {
+    loader_entries_len = 0;
+    loader_entries_full = false;
+}
+
+void bli_entries_add(const char *id) {
+    size_t len = strlen(id);
+
+    // Dropping whole identifiers keeps the list well formed when it fills.
+    if (loader_entries_full
+     || len + 1 > SIZEOF_ARRAY(loader_entries) - loader_entries_len) {
+        loader_entries_full = true;
+        return;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        loader_entries[loader_entries_len++] = (wchar_t)id[i];
+    }
+    loader_entries[loader_entries_len++] = L'\0';
+}
+
+void bli_entries_publish(void) {
+    gRT->SetVariable(L"LoaderEntries",
+            &bli_vendor_guid,
+            EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
+            loader_entries_len * sizeof(wchar_t),
+            loader_entries);
 }
 
 static bool handle_entry(wchar_t *variable, bool erase, char *path, size_t buf_size) {

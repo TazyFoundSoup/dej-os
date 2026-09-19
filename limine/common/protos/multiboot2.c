@@ -69,6 +69,26 @@ static size_t get_multiboot2_info_size(
 #undef OVERFLOW
 }
 
+// elsewhere_reserve_target() can only protect what is free when the target is
+// chosen, so a window holding loader allocations is not viable: whatever the
+// loader frees afterwards is handed back out on top of the executable.
+static bool overlaps_loader_memory(uint64_t base, uint64_t top) {
+    for (size_t i = 0; i < memmap_entries; i++) {
+        if (memmap[i].type != MEMMAP_BOOTLOADER_RECLAIMABLE
+         && memmap[i].type != MEMMAP_KERNEL_AND_MODULES) {
+            continue;
+        }
+
+        uint64_t entry_top = CHECKED_ADD(memmap[i].base, memmap[i].length, continue);
+
+        if (memmap[i].base < top && entry_top > base) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 #define append_tag(P, TAG) do { \
     (P) += ALIGN_UP((TAG)->size, MULTIBOOT_TAG_ALIGN, panic(true, "multiboot2: tag size overflow")); \
 } while (0)
@@ -91,7 +111,9 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
         panic(true, "multiboot2: Executable path not specified");
     }
 
-    print("multiboot2: Loading executable `%#`...\n", kernel_path);
+    if (!terse) {
+        print("multiboot2: Loading executable `%#`...\n", kernel_path);
+    }
 
     if ((kernel_file = uri_open(kernel_path, MEMMAP_KERNEL_AND_MODULES, false
 #if defined (__i386__)
@@ -162,13 +184,16 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
 
 #if defined (UEFI)
     bool is_framebuffer_required = false;
+    bool is_framebuffer_declared = false;
+    uint32_t console_flags = 0;
 #endif
 
     uint64_t entry_point = 0xffffffff;
 
     // Iterate through the entries...
     for (struct multiboot_header_tag *tag = (struct multiboot_header_tag*)(header + 1); // header + 1 to skip the header struct.
-       tag < (struct multiboot_header_tag *)((uintptr_t)header + header->header_length) && tag->type != MULTIBOOT_HEADER_TAG_END;
+       (uintptr_t)tag + sizeof(struct multiboot_header_tag) <= (uintptr_t)header + header->header_length
+         && tag->type != MULTIBOOT_HEADER_TAG_END;
        ) {
         if (tag->size == 0) {
             break;
@@ -215,6 +240,7 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
                         case MULTIBOOT_TAG_TYPE_FRAMEBUFFER:
                         #if defined (UEFI)
                             is_framebuffer_required = is_required;
+                            is_framebuffer_declared = true;
                         #endif
                             break;
                         case MULTIBOOT_TAG_TYPE_ACPI_NEW:
@@ -242,9 +268,7 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
                 if (tag->size < sizeof(struct multiboot_header_tag_console_flags))
                     break;
                 struct multiboot_header_tag_console_flags *flags = (void *)tag;
-                if ((flags->console_flags & (1 << 1)) && (flags->console_flags & (1 << 0))) {
-                    panic(true, "multiboot2: OS requested EGA text mode, but UEFI does not support it");
-                }
+                console_flags = flags->console_flags;
 #endif
                 break;
             }
@@ -305,6 +329,14 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
         }
         tag = (struct multiboot_header_tag *)((uintptr_t)tag + tag_stride);
     }
+
+#if defined (UEFI)
+    // Neither declaration of framebuffer support, so text is all that is left
+    // and UEFI has none. After the loop: either may follow the console tag.
+    if ((console_flags & 1) && fbtag == NULL && !is_framebuffer_declared) {
+        panic(true, "multiboot2: OS requires text mode, but UEFI does not support it");
+    }
+#endif
 
     bool section_hdr_info_valid = false;
     struct elf_section_hdr_info section_hdr_info = {0};
@@ -386,14 +418,16 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
 
         switch (bits) {
             case 32:
-                if (!elf32_load_elsewhere(kernel, kernel_file_size, &e, &ranges))
+                if (!elf32_load_elsewhere(kernel, kernel_file_size, 0xffffffff,
+                                          &e, &ranges))
                     panic(true, "multiboot2: ELF32 load failure");
 
                 section_hdr_info = elf32_section_hdr_info(kernel, kernel_file_size);
                 section_hdr_info_valid = true;
                 break;
             case 64: {
-                if (!elf64_load_elsewhere(kernel, kernel_file_size, &e, &ranges))
+                if (!elf64_load_elsewhere(kernel, kernel_file_size, 0xffffffff,
+                                          &e, &ranges))
                     panic(true, "multiboot2: ELF64 load failure");
 
                 section_hdr_info = elf64_section_hdr_info(kernel, kernel_file_size);
@@ -440,9 +474,21 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
                 break;
         }
 
+        // A small align turns this into a byte-by-byte walk, each step scanning
+        // the memory map. The cap bounds that work, and below page alignment it
+        // bounds the reach with it.
+        uint64_t reloc_tries = 0;
+
         for (;;) {
-            if (check_usable_memory(relocated_base, CHECKED_ADD(relocated_base, ranges->length, goto reloc_fail))) {
+            uint64_t relocated_top = CHECKED_ADD(relocated_base, ranges->length, goto reloc_fail);
+
+            if (check_usable_memory(relocated_base, relocated_top)
+             && !overlaps_loader_memory(relocated_base, relocated_top)) {
                 break;
+            }
+
+            if (++reloc_tries > 0x100000) {
+                goto reloc_fail;
             }
 
             if (reloc_ascend) {
@@ -465,9 +511,22 @@ noreturn void multiboot2_load(char *config, char* cmdline) {
         ranges->target = relocated_base;
     }
 
+    // multiboot_reloc_stub reads the range fields with 32-bit loads, so a
+    // target or length it cannot hold is truncated rather than refused.
+    if (ranges->target > 0x100000000
+     || ranges->length > 0xffffffff
+     || ranges->length > 0x100000000 - ranges->target) {
+        panic(true, "multiboot2: Executable does not fit under 4GiB");
+    }
+
     if (!check_usable_memory(ranges->target, ranges->target + ranges->length)) {
 reloc_fail:
         panic(true, "multiboot2: Could not find viable load address for executable");
+    }
+
+    if (entry_point < ranges->target
+     || entry_point >= ranges->target + ranges->length) {
+        panic(true, "multiboot2: Entry point is outside the executable");
     }
 
     // Reserve the kernel's target so later module/info sources can't be
@@ -570,8 +629,10 @@ reloc_fail:
 
         int bits = elf_bits(kernel, kernel_file_size);
 
-        if ((bits == 64 && section_hdr_info.section_entry_size < sizeof(struct elf64_shdr)) ||
-            (bits == 32 && section_hdr_info.section_entry_size < sizeof(struct elf32_shdr))) {
+        // No sections means no stride to check; the walk below cannot run.
+        if (section_hdr_info.num != 0
+         && ((bits == 64 && section_hdr_info.section_entry_size < sizeof(struct elf64_shdr))
+          || (bits == 32 && section_hdr_info.section_entry_size < sizeof(struct elf32_shdr)))) {
             panic(true, "multiboot2: ELF section entry size too small");
         }
 
@@ -655,7 +716,9 @@ reloc_fail:
         char *module_path = conf_tuple.value1;
         if (!module_path) panic(true, "multiboot2: Module disappeared unexpectedly");
 
-        print("multiboot2: Loading module `%#`...\n", module_path);
+        if (!terse) {
+            print("multiboot2: Loading module `%#`...\n", module_path);
+        }
 
         struct file_handle *f;
         if ((f = uri_open(module_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false
@@ -807,7 +870,8 @@ textmode:
                 tag->common.framebuffer_type = MULTIBOOT_FRAMEBUFFER_TYPE_EGA_TEXT;
                 tag->common.size = sizeof(struct multiboot_tag_framebuffer_common);
 #elif defined (UEFI)
-                if (is_framebuffer_required) {
+                // Bit 0 makes a console mandatory, and none can be provided here.
+                if (is_framebuffer_required || (console_flags & 1)) {
                     panic(true, "multiboot2: Failed to set video mode");
                 } else {
                     goto skip_modeset;

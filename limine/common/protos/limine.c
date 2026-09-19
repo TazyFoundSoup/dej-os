@@ -58,6 +58,9 @@ static enum executable_format detect_kernel_format(uint8_t *kernel, size_t kerne
 
 #define MEMMAP_MAX 1024
 
+// Bounds the entropy allocation; far past any cryptographic use anyway.
+#define ENTROPY_MAX_VALUES 4096
+
 static int paging_mode;
 
 static uint64_t get_hhdm_span_top(int base_revision) {
@@ -327,7 +330,9 @@ extern symbol limine_spinup_32;
 #define LIMINE_MAIR(fb) ( ((uint64_t)0b11111111 << 0) /* Normal WB RW-allocate non-transient */ \
                         | ((uint64_t)(fb) << 8) )     /* Framebuffer type */
 
-#define LIMINE_TCR(tsz, pa) ( ((uint64_t)(pa) << 32)         /* Intermediate address size */  \
+#define LIMINE_TCR(tsz, pa, ds)                                                               \
+                            ( ((uint64_t)(ds) << 59)         /* 52-bit addressing (DS) */     \
+                            | ((uint64_t)(pa) << 32)         /* Intermediate address size */  \
                             | ((uint64_t)2 << 30)            /* TTBR1 4K granule */           \
                             | ((uint64_t)3 << 28)            /* TTBR1 Inner shareable */      \
                             | ((uint64_t)1 << 26)            /* TTBR1 Outer WB RW-Allocate */ \
@@ -339,6 +344,64 @@ extern symbol limine_spinup_32;
                             | ((uint64_t)1 << 8)             /* TTBR0 Inner WB RW-Allocate */ \
                             | ((uint64_t)(tsz) << 0))        /* Address bits in TTBR0 */
 
+// Armv8.1 makes FEAT_VHE mandatory wherever EL2 is implemented, so EL2 without
+// it means Armv8.0, whose EL2 controls over EL1 are the fixed set
+// INIT_EL2_FOR_EL1 covers. Confirm rather than infer: for every extension
+// below, the values written on the way down are wrong, not just incomplete.
+static bool can_drop_to_el1(void) {
+    uint64_t reg;
+
+#define ID_FIELD(v, shift) (((v) >> (shift)) & 0xf)
+
+    // FEAT_RASv1p1 (HCR_EL2.FIEN), FEAT_SVE (CPTR_EL2.TZ), FEAT_MPAM
+    // (MPAM2_EL2), FEAT_AMUv1 (counter enables).
+    asm volatile ("mrs %0, id_aa64pfr0_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 28) >= 2 || ID_FIELD(reg, 32) != 0
+     || ID_FIELD(reg, 40) != 0 || ID_FIELD(reg, 44) != 0) {
+        return false;
+    }
+
+    // FEAT_MTE2 (HCR_EL2.ATA), FEAT_MPAM (MPAM2_EL2), FEAT_SME (CPTR_EL2.TSM),
+    // FEAT_GCS (HCRX_EL2.GCSEn).
+    asm volatile ("mrs %0, id_aa64pfr1_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 8) >= 2 || ID_FIELD(reg, 16) != 0
+     || ID_FIELD(reg, 24) != 0 || ID_FIELD(reg, 44) != 0) {
+        return false;
+    }
+
+    // FEAT_PAuth (HCR_EL2.{APK, API}), FEAT_LS64 (HCRX_EL2 enables).
+    asm volatile ("mrs %0, id_aa64isar1_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 4) != 0 || ID_FIELD(reg, 8) != 0
+     || ID_FIELD(reg, 24) != 0 || ID_FIELD(reg, 28) != 0
+     || ID_FIELD(reg, 60) != 0) {
+        return false;
+    }
+
+    // FEAT_FGT (the HFG and HDFG fine grained trap registers).
+    asm volatile ("mrs %0, id_aa64mmfr0_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 56) != 0) {
+        return false;
+    }
+
+    // FEAT_HCX (HCRX_EL2, several of whose enables trap when clear).
+    asm volatile ("mrs %0, id_aa64mmfr1_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 40) != 0) {
+        return false;
+    }
+
+    // FEAT_SPE (MDCR_EL2.E2PB), FEAT_TRF (MDCR_EL2.TTRF), FEAT_TRBE
+    // (MDCR_EL2.E2TB), FEAT_BRBE (BRBCR_EL2).
+    asm volatile ("mrs %0, id_aa64dfr0_el1" : "=r"(reg));
+    if (ID_FIELD(reg, 32) != 0 || ID_FIELD(reg, 40) != 0
+     || ID_FIELD(reg, 44) != 0 || ID_FIELD(reg, 52) != 0) {
+        return false;
+    }
+
+#undef ID_FIELD
+
+    return true;
+}
+
 #elif defined (__riscv)
 #elif defined (__loongarch64)
 #else
@@ -348,6 +411,7 @@ extern symbol limine_spinup_32;
 static uint64_t physical_base, virtual_base, slide, direct_map_offset;
 static size_t requests_count;
 static void **requests;
+static uint64_t requests_top;
 
 static void set_paging_mode(bool randomise_hhdm_base) {
     direct_map_offset = paging_mode_higher_half(paging_mode);
@@ -368,16 +432,50 @@ static uint64_t reported_addr_64(uint64_t addr) {
 }
 #endif
 
-#define get_phys_addr(addr) ({ \
-    __auto_type get_phys_addr__addr = (addr); \
-    uintptr_t get_phys_addr__r; \
-    if (get_phys_addr__addr & ((uint64_t)1 << 63)) { \
-        get_phys_addr__r = physical_base + (get_phys_addr__addr - virtual_base); \
-    } else { \
-        get_phys_addr__r = get_phys_addr__addr; \
-    } \
-    get_phys_addr__r; \
-})
+// The executable has not run, so every pointer it hands us names initialised
+// data inside its own image. Bound them there in 64 bits: the sum wraps at
+// pointer width on the 32-bit ports.
+static void *get_image_ptr(uint64_t addr, uint64_t size, uint64_t align) {
+    uint64_t image_size = requests_top - physical_base;
+    uint64_t off;
+
+    if (addr & ((uint64_t)1 << 63)) {
+        if (addr < virtual_base) {
+            return NULL;
+        }
+        off = addr - virtual_base;
+    } else {
+        if (addr < physical_base) {
+            return NULL;
+        }
+        off = addr - physical_base;
+    }
+
+    if (off > image_size || size > image_size - off) {
+        return NULL;
+    }
+
+    if ((physical_base + off) % align != 0) {
+        return NULL;
+    }
+
+    return (void *)(uintptr_t)(physical_base + off);
+}
+
+// A string has to end inside the image as well as begin there.
+static char *get_image_str(uint64_t addr) {
+    char *ret = get_image_ptr(addr, 1, 1);
+    if (ret == NULL) {
+        return NULL;
+    }
+
+    uint64_t left = requests_top - (uint64_t)(uintptr_t)ret;
+    if (strnlen(ret, left) == left) {
+        return NULL;
+    }
+
+    return ret;
+}
 
 static struct limine_file get_file(struct file_handle *file, char *cmdline) {
     struct limine_file ret = {0};
@@ -434,7 +532,7 @@ static struct limine_file get_file(struct file_handle *file, char *cmdline) {
     return ret;
 }
 
-static void *_get_request(uint64_t id[4]) {
+static void *_get_request(uint64_t id[4], size_t size) {
     for (size_t i = 0; i < requests_count; i++) {
         uint64_t *p = requests[i];
 
@@ -445,13 +543,35 @@ static void *_get_request(uint64_t id[4]) {
             continue;
         }
 
+        // The scan only proves the 32-byte ID is inside the image. Anything
+        // past it, revision and response included, has to be checked here.
+        // Widen before adding: at pointer width the sum wraps on 32-bit ports.
+        if ((uint64_t)(uintptr_t)p + size > requests_top) {
+            continue;
+        }
+
         return p;
     }
 
     return NULL;
 }
 
-#define get_request(REQ) _get_request((uint64_t[4])REQ)
+// Pass the variable the result is assigned to; its type gives the size that
+// has to fit in the image.
+#define get_request(VAR, REQ) _get_request((uint64_t[4])REQ, sizeof(*(VAR)))
+
+// A request that gained fields in a later revision is only required to carry
+// the prefix every revision has, so name the first field a later one added.
+#define get_request_rev0(VAR, REQ, REV1_MEMBER) \
+    _get_request((uint64_t[4])REQ, offsetof(typeof(*(VAR)), REV1_MEMBER))
+
+// Whether the fields get_request_rev0() left outside the bound are there.
+#define request_has_rev1(VAR) \
+    ((VAR)->revision >= 1 \
+     && (uint64_t)(uintptr_t)(VAR) + sizeof(*(VAR)) <= requests_top)
+
+// For presence tests, where nothing past the ID is read.
+#define have_request(REQ) (_get_request((uint64_t[4])REQ, sizeof(uint64_t[4])) != NULL)
 
 #define FEAT_START do {
 #define FEAT_END } while (0);
@@ -469,12 +589,20 @@ noreturn void limine_load(char *config, char *cmdline) {
 #endif
 
 #if defined (__aarch64__)
-    // Booting at EL2 without VHE is not supported.
+    // The executable is entered at EL2 only with VHE, where the *_EL1 state the
+    // protocol describes redirects to the EL2 bank.
+    bool want_el2 = false;
+    bool drop_to_el1 = false;
+
     if (current_el() == 2) {
         uint64_t mmfr1;
         asm volatile ("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
-        if (!((mmfr1 >> 8) & 0xF)) {
-            panic(true, "limine: Booting at EL2 without VHE support is not supported");
+        if ((mmfr1 >> 8) & 0xF) {
+            want_el2 = true;
+        } else if (can_drop_to_el1()) {
+            drop_to_el1 = true;
+        } else {
+            panic(true, "limine: Booting at EL2 without VHE is only supported on Armv8.0 processors");
         }
     }
 #endif
@@ -487,7 +615,9 @@ noreturn void limine_load(char *config, char *cmdline) {
         panic(true, "limine: Executable path not specified");
     }
 
-    print("limine: Loading executable `%#`...\n", kernel_path);
+    if (!terse) {
+        print("limine: Loading executable `%#`...\n", kernel_path);
+    }
 
     struct file_handle *kernel_file;
     if ((kernel_file = uri_open(kernel_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false
@@ -578,11 +708,13 @@ noreturn void limine_load(char *config, char *cmdline) {
     bool base_revision_found = false;
     uint64_t *base_rev_p1_ptr = NULL;
     uint64_t *base_rev_p2_ptr = NULL;
-    for (size_t i = 0; i + 32 <= image_size_before_bss; i += 8) {
+    // Each test bounds itself; stop where the smallest cannot match.
+    for (size_t i = 0; i + sizeof(limine_requests_end_marker) <= image_size_before_bss; i += 8) {
         uint64_t *p = (void *)(uintptr_t)physical_base + i;
 
         // Check if start marker hit
-        if (p[0] == limine_requests_start_marker[0] && p[1] == limine_requests_start_marker[1]
+        if (i + sizeof(limine_requests_start_marker) <= image_size_before_bss
+         && p[0] == limine_requests_start_marker[0] && p[1] == limine_requests_start_marker[1]
          && p[2] == limine_requests_start_marker[2] && p[3] == limine_requests_start_marker[3]) {
             base_revision = 0;
             base_revision_found = false;
@@ -592,11 +724,13 @@ noreturn void limine_load(char *config, char *cmdline) {
         }
 
         // Check if end marker hit
-        if (p[0] == limine_requests_end_marker[0] && p[1] == limine_requests_end_marker[1]) {
+        if (i + sizeof(limine_requests_end_marker) <= image_size_before_bss
+         && p[0] == limine_requests_end_marker[0] && p[1] == limine_requests_end_marker[1]) {
             break;
         }
 
-        if (p[0] == limine_base_revision[0] && p[1] == limine_base_revision[1]) {
+        if (i + sizeof(limine_base_revision) <= image_size_before_bss
+         && p[0] == limine_base_revision[0] && p[1] == limine_base_revision[1]) {
             if (base_revision_found) {
                 panic(true, "limine: Duplicated base revision tag");
             }
@@ -625,6 +759,7 @@ noreturn void limine_load(char *config, char *cmdline) {
 #endif
 
     // Load requests
+    requests_top = physical_base + image_size_before_bss;
     uint64_t *limine_reqs = NULL;
     requests = ext_mem_alloc_counted(MAX_REQUESTS, sizeof(void *));
     requests_count = 0;
@@ -636,30 +771,46 @@ noreturn void limine_load(char *config, char *cmdline) {
             if (limine_reqs[i] == 0) {
                 break;
             }
+            // _get_request compares the whole ID before its own bound applies.
+            uint64_t reqs_off = limine_reqs[i] - virtual_base;
             if (limine_reqs[i] < virtual_base
-             || limine_reqs[i] - virtual_base >= image_size_before_bss) {
+             || reqs_off >= image_size_before_bss
+             || image_size_before_bss - reqs_off < sizeof(uint64_t[4])) {
                 panic(true, "limine: .limine_reqs entry outside kernel image");
             }
-            requests[i] = (void *)(uintptr_t)((limine_reqs[i] - virtual_base) + physical_base);
+
+            // _get_request() reads the ID through this pointer as 64-bit
+            // loads, which riscv64 and loongarch64 are permitted to trap on.
+            if (reqs_off % sizeof(uint64_t) != 0) {
+                panic(true, "limine: .limine_reqs entry is not 8-byte aligned");
+            }
+
+            requests[i] = (void *)(uintptr_t)(reqs_off + physical_base);
             requests_count++;
         }
     } else {
         uint64_t common_magic[2] = { LIMINE_COMMON_MAGIC };
-        for (size_t i = 0; i + 32 <= image_size_before_bss; i += 8) {
+        // Each test bounds itself; stop where the smallest cannot match.
+        for (size_t i = 0; i + sizeof(limine_requests_end_marker) <= image_size_before_bss; i += 8) {
             uint64_t *p = (void *)(uintptr_t)physical_base + i;
 
             // Check if start marker hit
-            if (p[0] == limine_requests_start_marker[0] && p[1] == limine_requests_start_marker[1]
+            if (i + sizeof(limine_requests_start_marker) <= image_size_before_bss
+             && p[0] == limine_requests_start_marker[0] && p[1] == limine_requests_start_marker[1]
              && p[2] == limine_requests_start_marker[2] && p[3] == limine_requests_start_marker[3]) {
                 requests_count = 0;
                 continue;
             }
 
             // Check if end marker hit
-            if (p[0] == limine_requests_end_marker[0] && p[1] == limine_requests_end_marker[1]) {
+            if (i + sizeof(limine_requests_end_marker) <= image_size_before_bss
+             && p[0] == limine_requests_end_marker[0] && p[1] == limine_requests_end_marker[1]) {
                 break;
             }
 
+            if (i + sizeof(uint64_t[4]) > image_size_before_bss) {
+                continue;
+            }
             if (p[0] != common_magic[0]) {
                 continue;
             }
@@ -672,7 +823,7 @@ noreturn void limine_load(char *config, char *cmdline) {
             }
 
             // Check for a conflict
-            if (_get_request(p) != NULL) {
+            if (_get_request(p, sizeof(uint64_t[4])) != NULL) {
                 panic(true, "limine: Conflict detected for request ID %X %X", p[2], p[3]);
             }
 
@@ -733,12 +884,17 @@ noreturn void limine_load(char *config, char *cmdline) {
         goto hhdm_fail;
     }
 #elif defined (__aarch64__)
-    max_supported_paging_mode = PAGING_MODE_AARCH64_4LVL;
+    max_supported_paging_mode = vmm_max_paging_mode();
     min_supported_paging_mode = PAGING_MODE_AARCH64_4LVL;
+    if (hhdm_span_top >= (uint64_t)1 << (paging_mode_va_bits(min_supported_paging_mode) - 2)) {
+        min_supported_paging_mode = PAGING_MODE_AARCH64_5LVL;
+        if (min_supported_paging_mode > max_supported_paging_mode) {
+            goto hhdm_fail;
+        }
+    }
     if (hhdm_span_top >= (uint64_t)1 << (paging_mode_va_bits(min_supported_paging_mode) - 2)) {
         goto hhdm_fail;
     }
-    // TODO(qookie): aarch64 also has optional 5 level paging when using 4K pages
 #elif defined (__riscv)
     max_supported_paging_mode = vmm_max_paging_mode();
     min_supported_paging_mode = PAGING_MODE_RISCV_SV39;
@@ -888,9 +1044,21 @@ hhdm_fail:
 #endif
 
     bool paging_mode_set = false;
-    bool randomise_hhdm_base = false;
+
+    // This has to be resolved outside the block below: an executable with no
+    // paging mode request breaks out of it, and the fallback still needs it.
+    char *randomise_hhdm_base_s = config_get_value(config, 0, "RANDOMISE_HHDM_BASE");
+    if (randomise_hhdm_base_s == NULL) {
+        randomise_hhdm_base_s = config_get_value(config, 0, "RANDOMIZE_HHDM_BASE");
+    }
+    bool randomise_hhdm_base;
+    if (randomise_hhdm_base_s == NULL) {
+        randomise_hhdm_base = kaslr;
+    } else {
+        randomise_hhdm_base = strcasecmp(randomise_hhdm_base_s, "yes") == 0;
+    }
 FEAT_START
-    struct limine_paging_mode_request *pm_request = get_request(LIMINE_PAGING_MODE_REQUEST_ID);
+    struct limine_paging_mode_request *pm_request = get_request_rev0(pm_request, LIMINE_PAGING_MODE_REQUEST_ID, max_mode);
     if (pm_request == NULL)
         break;
 
@@ -898,7 +1066,7 @@ FEAT_START
     paging_mode = paging_mode_limine_to_vmm(target_mode);
 
     int kern_min_mode = PAGING_MODE_MIN, kern_max_mode = paging_mode;
-    if (pm_request->revision >= 1) {
+    if (request_has_rev1(pm_request)) {
         kern_min_mode = (int)paging_mode_limine_to_vmm(pm_request->min_mode);
         kern_max_mode = (int)paging_mode_limine_to_vmm(pm_request->max_mode);
     }
@@ -927,16 +1095,6 @@ FEAT_START
         paging_mode = kern_min_mode;
     }
 
-    char *randomise_hhdm_base_s = config_get_value(config, 0, "RANDOMISE_HHDM_BASE");
-    if (randomise_hhdm_base_s == NULL) {
-        randomise_hhdm_base_s = config_get_value(config, 0, "RANDOMIZE_HHDM_BASE");
-    }
-    if (randomise_hhdm_base_s == NULL) {
-        randomise_hhdm_base = kaslr;
-    } else {
-        randomise_hhdm_base = strcasecmp(randomise_hhdm_base_s, "yes") == 0;
-    }
-
     set_paging_mode(randomise_hhdm_base);
     paging_mode_set = true;
 
@@ -948,6 +1106,15 @@ FEAT_START
 FEAT_END
 
     if (!paging_mode_set) {
+        // With no request the protocol assumes max_mode is the default, so a
+        // supported range above it is refused rather than raised past.
+        if (paging_mode > max_supported_paging_mode) {
+            paging_mode = max_supported_paging_mode;
+        }
+        if (paging_mode < min_supported_paging_mode) {
+            panic(true, "limine: Default paging mode lower than minimum allowable paging mode");
+        }
+
         set_paging_mode(randomise_hhdm_base);
     }
 
@@ -958,6 +1125,9 @@ FEAT_END
     uint64_t pa = aa64mmfr0 & 0xF;
 
     uint64_t tsz = 64 - (paging_mode_va_bits(paging_mode) - 1);
+
+    // A 52-bit VA needs a TxSZ of 12, which is only in range under TCR_EL1.DS.
+    uint64_t ds = paging_mode == PAGING_MODE_AARCH64_5LVL;
 #endif
 
     struct limine_file *kf = ext_mem_alloc(sizeof(struct limine_file));
@@ -966,7 +1136,7 @@ FEAT_END
 
     // Entry point feature
 FEAT_START
-    struct limine_entry_point_request *entrypoint_request = get_request(LIMINE_ENTRY_POINT_REQUEST_ID);
+    struct limine_entry_point_request *entrypoint_request = get_request(entrypoint_request, LIMINE_ENTRY_POINT_REQUEST_ID);
     if (entrypoint_request == NULL) {
         break;
     }
@@ -986,7 +1156,7 @@ FEAT_END
     bool keep_iommu = false;
 FEAT_START
     struct limine_x86_64_keep_iommu_request *keep_iommu_request =
-        get_request(LIMINE_X86_64_KEEP_IOMMU_REQUEST_ID);
+        get_request(keep_iommu_request, LIMINE_X86_64_KEEP_IOMMU_REQUEST_ID);
     if (keep_iommu_request == NULL) {
         break;
     }
@@ -1001,7 +1171,7 @@ FEAT_END
 
     // Bootloader info feature
 FEAT_START
-    struct limine_bootloader_info_request *bootloader_info_request = get_request(LIMINE_BOOTLOADER_INFO_REQUEST_ID);
+    struct limine_bootloader_info_request *bootloader_info_request = get_request(bootloader_info_request, LIMINE_BOOTLOADER_INFO_REQUEST_ID);
     if (bootloader_info_request == NULL) {
         break; // next feature
     }
@@ -1017,7 +1187,8 @@ FEAT_END
 
     // Executable Command Line feature
 FEAT_START
-    struct limine_executable_cmdline_request *executable_cmdline_request = get_request(LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID);
+    struct limine_executable_cmdline_request *executable_cmdline_request =
+        get_request(executable_cmdline_request, LIMINE_EXECUTABLE_CMDLINE_REQUEST_ID);
     if (executable_cmdline_request == NULL) {
         break; // next feature
     }
@@ -1032,7 +1203,7 @@ FEAT_END
 
     // Firmware type feature
 FEAT_START
-    struct limine_firmware_type_request *firmware_type_request = get_request(LIMINE_FIRMWARE_TYPE_REQUEST_ID);
+    struct limine_firmware_type_request *firmware_type_request = get_request(firmware_type_request, LIMINE_FIRMWARE_TYPE_REQUEST_ID);
     if (firmware_type_request == NULL) {
         break; // next feature
     }
@@ -1057,7 +1228,8 @@ FEAT_END
 
     // Executable address feature
 FEAT_START
-    struct limine_executable_address_request *executable_address_request = get_request(LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID);
+    struct limine_executable_address_request *executable_address_request =
+        get_request(executable_address_request, LIMINE_EXECUTABLE_ADDRESS_REQUEST_ID);
     if (executable_address_request == NULL) {
         break; // next feature
     }
@@ -1073,7 +1245,7 @@ FEAT_END
 
     // HHDM feature
 FEAT_START
-    struct limine_hhdm_request *hhdm_request = get_request(LIMINE_HHDM_REQUEST_ID);
+    struct limine_hhdm_request *hhdm_request = get_request(hhdm_request, LIMINE_HHDM_REQUEST_ID);
     if (hhdm_request == NULL) {
         break; // next feature
     }
@@ -1088,7 +1260,7 @@ FEAT_END
 
     // RSDP feature
 FEAT_START
-    struct limine_rsdp_request *rsdp_request = get_request(LIMINE_RSDP_REQUEST_ID);
+    struct limine_rsdp_request *rsdp_request = get_request(rsdp_request, LIMINE_RSDP_REQUEST_ID);
     if (rsdp_request == NULL) {
         break; // next feature
     }
@@ -1108,7 +1280,7 @@ FEAT_END
 
     // SMBIOS feature
 FEAT_START
-    struct limine_smbios_request *smbios_request = get_request(LIMINE_SMBIOS_REQUEST_ID);
+    struct limine_smbios_request *smbios_request = get_request(smbios_request, LIMINE_SMBIOS_REQUEST_ID);
     if (smbios_request == NULL) {
         break; // next feature
     }
@@ -1135,7 +1307,7 @@ FEAT_END
 #if defined (UEFI)
     // EFI system table feature
 FEAT_START
-    struct limine_efi_system_table_request *est_request = get_request(LIMINE_EFI_SYSTEM_TABLE_REQUEST_ID);
+    struct limine_efi_system_table_request *est_request = get_request(est_request, LIMINE_EFI_SYSTEM_TABLE_REQUEST_ID);
     if (est_request == NULL) {
         break; // next feature
     }
@@ -1152,7 +1324,7 @@ FEAT_END
     // Stack size
     uint64_t stack_size = 65536;
 FEAT_START
-    struct limine_stack_size_request *stack_size_request = get_request(LIMINE_STACK_SIZE_REQUEST_ID);
+    struct limine_stack_size_request *stack_size_request = get_request(stack_size_request, LIMINE_STACK_SIZE_REQUEST_ID);
     if (stack_size_request == NULL) {
         break; // next feature
     }
@@ -1167,9 +1339,12 @@ FEAT_START
     stack_size_request->response = reported_addr(stack_size_response);
 FEAT_END
 
+    // x86-64 enters at 8 mod 16 from this, the return address having been pushed.
+    stack_size = ALIGN_UP(stack_size, 16, panic(true, "limine: Stack size overflow"));
+
     // Executable file
 FEAT_START
-    struct limine_executable_file_request *executable_file_request = get_request(LIMINE_EXECUTABLE_FILE_REQUEST_ID);
+    struct limine_executable_file_request *executable_file_request = get_request(executable_file_request, LIMINE_EXECUTABLE_FILE_REQUEST_ID);
     if (executable_file_request == NULL) {
         break; // next feature
     }
@@ -1184,7 +1359,7 @@ FEAT_END
 
     // Modules
 FEAT_START
-    struct limine_module_request *module_request = get_request(LIMINE_MODULE_REQUEST_ID);
+    struct limine_module_request *module_request = get_request_rev0(module_request, LIMINE_MODULE_REQUEST_ID, internal_module_count);
     if (module_request == NULL) {
         break; // next feature
     }
@@ -1196,7 +1371,20 @@ FEAT_START
             break;
     }
 
-    if (module_request->revision >= 1) {
+    uint64_t *internal_modules = NULL;
+
+    // PROTOCOL.md does not require internal_modules to be non-NULL as it does
+    // path and string, so a request declaring none says nothing about it.
+    if (request_has_rev1(module_request) && module_request->internal_module_count != 0) {
+        uint64_t array_size = CHECKED_MUL(module_request->internal_module_count,
+                (uint64_t)sizeof(uint64_t),
+                panic(true, "limine: Too many internal modules"));
+
+        internal_modules = get_image_ptr(module_request->internal_modules, array_size, 8);
+        if (internal_modules == NULL) {
+            panic(true, "limine: Internal module array is outside the executable");
+        }
+
         module_count += module_request->internal_module_count;
     }
 
@@ -1218,12 +1406,18 @@ FEAT_START
         bool module_required = true;
         bool module_path_allocated = false;
 
-        if (module_request->revision >= 1 && i < module_request->internal_module_count) {
-            uint64_t *internal_modules = (void *)get_phys_addr(module_request->internal_modules);
-            struct limine_internal_module *internal_module = (void *)get_phys_addr(internal_modules[i]);
+        if (internal_modules != NULL && i < module_request->internal_module_count) {
+            struct limine_internal_module *internal_module =
+                get_image_ptr(internal_modules[i], sizeof(struct limine_internal_module), 8);
+            if (internal_module == NULL) {
+                panic(true, "limine: Internal module is outside the executable");
+            }
 
-            module_path = (char *)get_phys_addr(internal_module->path);
-            module_cmdline = (char *)get_phys_addr(internal_module->string);
+            module_path = get_image_str(internal_module->path);
+            module_cmdline = get_image_str(internal_module->string);
+            if (module_path == NULL || module_cmdline == NULL) {
+                panic(true, "limine: Internal module path or string is outside the executable");
+            }
 
             bool module_compressed = internal_module->flags & LIMINE_INTERNAL_MODULE_COMPRESSED;
 
@@ -1260,7 +1454,7 @@ FEAT_START
 
             module_required = internal_module->flags & LIMINE_INTERNAL_MODULE_REQUIRED;
         } else {
-            size_t config_index = i - (module_request->revision >= 1 ? module_request->internal_module_count : 0);
+            size_t config_index = i - (request_has_rev1(module_request) ? module_request->internal_module_count : 0);
 
             // Try MODULE_STRING first, then fall back to MODULE_CMDLINE
             struct conf_tuple conf_tuple =
@@ -1278,7 +1472,9 @@ FEAT_START
             module_cmdline = module_cmdline ? strdup(module_cmdline) : "";
         }
 
-        print("limine: Loading module `%#`...\n", module_path);
+        if (!terse) {
+            print("limine: Loading module `%#`...\n", module_path);
+        }
 
         struct file_handle *f;
         // On IA-32 under measured boot, refuse >4 GiB allocations: firmware's
@@ -1330,18 +1526,19 @@ FEAT_END
 
     // Device tree blob feature
 FEAT_START
-    struct limine_dtb_request *dtb_request = get_request(LIMINE_DTB_REQUEST_ID);
+    struct limine_dtb_request *dtb_request = get_request(dtb_request, LIMINE_DTB_REQUEST_ID);
     if (dtb_request == NULL) {
         break; // next feature
     }
 
-    void *dtb = get_device_tree_blob(config, 0, true);
+    void *dtb = get_device_tree_blob(config, 0, true, true);
 
     if (dtb) {
         // Delete all /memory@... nodes.
         // The executable must use the given UEFI memory map instead.
         while (true) {
-            int offset = fdt_subnode_offset_namelen(dtb, 0, "memory@", 7);
+            // libfdt matches a unit address only if this name has no `@`.
+            int offset = fdt_subnode_offset_namelen(dtb, 0, "memory", 6);
 
             if (offset == -FDT_ERR_NOTFOUND) {
                 break;
@@ -1374,7 +1571,9 @@ FEAT_END
     struct fb_info *fbs;
     size_t fbs_count;
 
-    bool preserve_screen = get_request(LIMINE_FLANTERM_FB_INIT_PARAMS_REQUEST_ID) != NULL;
+    // A clear that cannot be flushed only partly reaches memory.
+    bool preserve_screen = have_request(LIMINE_FLANTERM_FB_INIT_PARAMS_REQUEST_ID)
+                        || !fb_flush_reliable();
 
     term_notready();
 
@@ -1451,7 +1650,7 @@ FEAT_END
 
     // Framebuffer feature
 FEAT_START
-    struct limine_framebuffer_request *framebuffer_request = get_request(LIMINE_FRAMEBUFFER_REQUEST_ID);
+    struct limine_framebuffer_request *framebuffer_request = get_request(framebuffer_request, LIMINE_FRAMEBUFFER_REQUEST_ID);
     if (framebuffer_request == NULL) {
         break; // next feature
     }
@@ -1507,7 +1706,7 @@ FEAT_END
 
     // Flanterm FB init params feature
 FEAT_START
-    struct limine_flanterm_fb_init_params_request *fip_request = get_request(LIMINE_FLANTERM_FB_INIT_PARAMS_REQUEST_ID);
+    struct limine_flanterm_fb_init_params_request *fip_request = get_request(fip_request, LIMINE_FLANTERM_FB_INIT_PARAMS_REQUEST_ID);
     if (fip_request == NULL) {
         break;
     }
@@ -1565,7 +1764,7 @@ FEAT_END
 no_fb:
     // Boot time feature
 FEAT_START
-    struct limine_date_at_boot_request *date_at_boot_request = get_request(LIMINE_DATE_AT_BOOT_REQUEST_ID);
+    struct limine_date_at_boot_request *date_at_boot_request = get_request(date_at_boot_request, LIMINE_DATE_AT_BOOT_REQUEST_ID);
     if (date_at_boot_request == NULL) {
         break; // next feature
     }
@@ -1660,7 +1859,7 @@ FEAT_START
         break;
     }
 
-    struct limine_tsc_frequency_request *tsc_freq_request = get_request(LIMINE_TSC_FREQUENCY_REQUEST_ID);
+    struct limine_tsc_frequency_request *tsc_freq_request = get_request(tsc_freq_request, LIMINE_TSC_FREQUENCY_REQUEST_ID);
     if (tsc_freq_request == NULL) {
         break;
     }
@@ -1673,13 +1872,47 @@ FEAT_START
     tsc_freq_request->response = reported_addr(tsc_freq_response);
 FEAT_END
 
+    // Entropy
+FEAT_START
+    struct limine_entropy_request *entropy_request = get_request(entropy_request, LIMINE_ENTROPY_REQUEST_ID);
+    if (entropy_request == NULL) {
+        break;
+    }
+
+    uint64_t entropy_count = entropy_request->value_count;
+    if (entropy_count > ENTROPY_MAX_VALUES) {
+        entropy_count = ENTROPY_MAX_VALUES;
+    }
+
+    struct limine_entropy_response *entropy_response =
+        ext_mem_alloc(sizeof(struct limine_entropy_response));
+
+    if (entropy_count > 0) {
+        uint64_t *entropy_values = ext_mem_alloc_counted(entropy_count, sizeof(uint64_t));
+
+        // Raw hardware entropy for as much of the array as it can give.
+        size_t entropy_filled = hw_entropy(entropy_values, entropy_count * sizeof(uint64_t));
+
+        // The seeded PRNG covers the rest, mixed over any partial value.
+        for (uint64_t i = entropy_filled / sizeof(uint64_t); i < entropy_count; i++) {
+            entropy_values[i] ^= rand64();
+        }
+
+        entropy_response->values = reported_addr(entropy_values);
+    }
+
+    entropy_response->value_count = entropy_count;
+
+    entropy_request->response = reported_addr(entropy_response);
+FEAT_END
+
     // Bootloader Performance
 FEAT_START
     if (usec_at_bootloader_entry == 0) {
         break;
     }
 
-    struct limine_bootloader_performance_request *perf_request = get_request(LIMINE_BOOTLOADER_PERFORMANCE_REQUEST_ID);
+    struct limine_bootloader_performance_request *perf_request = get_request(perf_request, LIMINE_BOOTLOADER_PERFORMANCE_REQUEST_ID);
     if (perf_request == NULL) {
         break;
     }
@@ -1698,7 +1931,7 @@ FEAT_END
     // containing all of Limine's extends; later extends would land in the
     // final-events table instead.
 FEAT_START
-    struct limine_tpm_event_log_request *tpm_event_log_request = get_request(LIMINE_TPM_EVENT_LOG_REQUEST_ID);
+    struct limine_tpm_event_log_request *tpm_event_log_request = get_request(tpm_event_log_request, LIMINE_TPM_EVENT_LOG_REQUEST_ID);
     if (tpm_event_log_request == NULL) {
         break; // next feature
     }
@@ -1721,13 +1954,23 @@ FEAT_START
     tpm_event_log_request->response = reported_addr(tpm_event_log_response);
 FEAT_END
 
+#if defined (__aarch64__) || defined (__loongarch64)
+    // init_smp() runs once boot services are gone, where its device tree
+    // fallback could no longer open a file for itself. ACPI answers first, so a
+    // dtb_path this boot never reads must cost it the tree rather than the boot.
+    void *smp_dtb = NULL;
+    if (have_request(LIMINE_MP_REQUEST_ID)) {
+        smp_dtb = get_device_tree_blob(config, 0, false, false);
+    }
+#endif
+
     efi_exit_boot_services();
 #endif
 
     // EFI memory map
 #if defined (UEFI)
 FEAT_START
-    struct limine_efi_memmap_request *efi_memmap_request = get_request(LIMINE_EFI_MEMMAP_REQUEST_ID);
+    struct limine_efi_memmap_request *efi_memmap_request = get_request(efi_memmap_request, LIMINE_EFI_MEMMAP_REQUEST_ID);
     if (efi_memmap_request == NULL) {
         break; // next feature
     }
@@ -1764,14 +2007,9 @@ FEAT_END
     pagemap = build_pagemap(base_revision, nx_available, ranges, ranges_count,
                             physical_base, virtual_base, direct_map_offset);
 
-#if defined (__aarch64__)
-    // Enter at EL2 with VHE if we are at EL2 (VHE check done at function entry)
-    bool want_el2 = (current_el() == 2);
-#endif
-
     // MP
 FEAT_START
-    struct limine_mp_request *mp_request = get_request(LIMINE_MP_REQUEST_ID);
+    struct limine_mp_request *mp_request = get_request(mp_request, LIMINE_MP_REQUEST_ID);
     if (mp_request == NULL) {
         break; // next feature
     }
@@ -1788,14 +2026,15 @@ FEAT_START
 #elif defined (__aarch64__)
     uint64_t bsp_mpidr;
 
-    mp_info = init_smp(config, &cpu_count, &bsp_mpidr,
-                        pagemap, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa), LIMINE_SCTLR,
-                        direct_map_offset);
+    mp_info = init_smp(smp_dtb, &cpu_count, &bsp_mpidr,
+                        pagemap, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa, ds), LIMINE_SCTLR,
+                        direct_map_offset, drop_to_el1);
 #elif defined (__riscv)
     mp_info = init_smp(&cpu_count, pagemap, direct_map_offset);
 #elif defined (__loongarch64)
     uint32_t bsp_phys_id;
-    mp_info = init_smp(&cpu_count, &bsp_phys_id, pagemap, direct_map_offset);
+    mp_info = init_smp(smp_dtb, &cpu_count, &bsp_phys_id, pagemap,
+                        direct_map_offset);
 #else
 #error Unknown architecture
 #endif
@@ -1857,11 +2096,17 @@ FEAT_START
     mp_request->response = reported_addr(mp_response);
 FEAT_END
 
+#if defined (__aarch64__) || defined (__loongarch64)
+    if (smp_dtb != NULL) {
+        pmm_free(smp_dtb, fdt_totalsize(smp_dtb));
+    }
+#endif
+
 #if defined (__x86_64__) || defined (__i386__)
     // If there was no MP request, the kernel has no way to tell us it supports
     // x2APIC. Try to disable it as a courtesy, but do not panic if we cannot
     // since the kernel may be able to deal with it itself.
-    if (get_request(LIMINE_MP_REQUEST_ID) == NULL
+    if (!have_request(LIMINE_MP_REQUEST_ID)
      && (rdmsr(0x1b) & (1 << 10))) {
         if (x2apic_disable()) {
             printv("limine: Firmware had x2APIC enabled, reverted to xAPIC mode\n");
@@ -1874,7 +2119,7 @@ FEAT_END
 #if defined(__riscv)
     // RISC-V BSP Hart ID
 FEAT_START
-    struct limine_riscv_bsp_hartid_request *bsp_request = get_request(LIMINE_RISCV_BSP_HARTID_REQUEST_ID);
+    struct limine_riscv_bsp_hartid_request *bsp_request = get_request(bsp_request, LIMINE_RISCV_BSP_HARTID_REQUEST_ID);
     if (bsp_request == NULL) {
         break;
     }
@@ -1886,7 +2131,7 @@ FEAT_END
 
     // Memmap
 FEAT_START
-    struct limine_memmap_request *memmap_request = get_request(LIMINE_MEMMAP_REQUEST_ID);
+    struct limine_memmap_request *memmap_request = get_request(memmap_request, LIMINE_MEMMAP_REQUEST_ID);
     struct limine_memmap_response *memmap_response;
     struct limine_memmap_entry *_memmap;
     uint64_t *memmap_list;
@@ -2000,14 +2245,14 @@ FEAT_END
     uint64_t reported_stack = reported_addr(stack);
 
     if (want_el2) {
-        enter_in_el2(entry_point, reported_stack, LIMINE_SCTLR, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa),
-                     (uint64_t)pagemap.top_level[0],
-                     (uint64_t)pagemap.top_level[1],
+        enter_in_el2(entry_point, reported_stack, LIMINE_SCTLR, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa, ds),
+                     make_ttbr(pagemap, 0),
+                     make_ttbr(pagemap, 1),
                      direct_map_offset);
     } else {
-        enter_in_el1(entry_point, reported_stack, LIMINE_SCTLR, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa),
-                     (uint64_t)pagemap.top_level[0],
-                     (uint64_t)pagemap.top_level[1],
+        enter_in_el1(entry_point, reported_stack, LIMINE_SCTLR, LIMINE_MAIR(fb_attr), LIMINE_TCR(tsz, pa, ds),
+                     make_ttbr(pagemap, 0),
+                     make_ttbr(pagemap, 1),
                      direct_map_offset);
     }
 #elif defined (__riscv)

@@ -23,14 +23,15 @@ struct limine_mp_info *init_smp(size_t   *cpu_count,
 
 #elif defined (__aarch64__)
 
-struct limine_mp_info *init_smp(const char *config,
+struct limine_mp_info *init_smp(void     *dtb,
                                  size_t   *cpu_count,
                                  uint64_t *bsp_mpidr,
                                  pagemap_t pagemap,
                                  uint64_t  mair,
                                  uint64_t  tcr,
                                  uint64_t  sctlr,
-                                 uint64_t  hhdm_offset);
+                                 uint64_t  hhdm_offset,
+                                 bool      drop_to_el1);
 
 #elif defined (__riscv)
 
@@ -40,8 +41,9 @@ struct limine_mp_info *init_smp(size_t   *cpu_count,
 
 #elif defined (__loongarch64)
 
-struct limine_mp_info *init_smp(size_t *cpu_count, uint32_t *bsp_phys_id,
-                                pagemap_t pagemap, uint64_t hhdm_offset);
+struct limine_mp_info *init_smp(void *dtb, size_t *cpu_count,
+                                uint32_t *bsp_phys_id, pagemap_t pagemap,
+                                uint64_t hhdm_offset);
 
 #else
 #error Unknown architecture

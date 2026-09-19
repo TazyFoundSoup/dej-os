@@ -242,13 +242,13 @@ bool init_config_smbios(void) {
             size_t prefix_len = sizeof("limine:config:") - 1;
             if (string_area_size > prefix_len && !strncmp(string_data, "limine:config:", prefix_len)) {
                 size_t total_len = strnlen(string_data, string_area_size);
-                if (total_len <= prefix_len)
-                    continue;
-                size_t config_size = total_len - prefix_len + 2;
-                config_addr = ext_mem_alloc(config_size);
-                memcpy(config_addr, &string_data[prefix_len], config_size - 1);
-                config_addr[config_size - 1] = '\0';
-                return !init_config(config_size);
+                if (total_len > prefix_len) {
+                    size_t config_size = total_len - prefix_len + 2;
+                    config_addr = ext_mem_alloc(config_size);
+                    memcpy(config_addr, &string_data[prefix_len], config_size - 1);
+                    config_addr[config_size - 1] = '\0';
+                    return !init_config(config_size);
+                }
             }
         }
 
@@ -452,6 +452,12 @@ skip_loop:
     fw_type_macro->next = macros;
     macros = fw_type_macro;
 
+    struct macro *loader_arch_macro = ext_mem_alloc(sizeof(struct macro));
+    strcpy(loader_arch_macro->name, "LOADER_ARCH");
+    strcpy(loader_arch_macro->value, loader_arch());
+    loader_arch_macro->next = macros;
+    macros = loader_arch_macro;
+
     for (size_t i = 0; i < config_size;) {
         if ((config_size - i >= 3 && memcmp(config_addr + i, "\n${", 3) == 0)
          || (config_size - i >= 2 && i == 0 && memcmp(config_addr, "${", 2) == 0)) {
@@ -612,7 +618,7 @@ overflow:
 }
 
 static char *config_get_entry_name(size_t index) {
-    if (!config_ready)
+    if (!config_ready || config_addr == NULL)
         return NULL;
 
     char *p = config_addr;
@@ -631,7 +637,7 @@ static char *config_get_entry_name(size_t index) {
     p--;
 
     size_t len = 0;
-    while (p[len] != SEPARATOR) {
+    while (p[len] != SEPARATOR && p[len] != '\0') {
         len++;
     }
 
@@ -642,7 +648,7 @@ static char *config_get_entry_name(size_t index) {
 }
 
 static char *config_get_entry(size_t *size, size_t index) {
-    if (!config_ready)
+    if (!config_ready || config_addr == NULL)
         return NULL;
 
     char *ret;
@@ -744,6 +750,11 @@ char *config_get_value(const char *config, size_t index, const char *key) {
 
     if (config == NULL)
         config = config_addr;
+
+    // config_ready does not imply a config file was loaded: the blank entry
+    // editor sets it with config_addr still unset.
+    if (config == NULL)
+        return NULL;
 
     size_t key_len = strlen(key);
 

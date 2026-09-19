@@ -56,6 +56,7 @@ static bool stage3_init(struct volume *part) {
 
     if (stage3->size != (size_t)limine_bios_sys_size) {
         print("limine-bios.sys size incorrect.\n");
+        fclose(stage3);
         return false;
     }
 
@@ -87,6 +88,8 @@ noreturn void entry(uint8_t boot_drive, int boot_from) {
         panic(false, "Could not enable A20 line");
     }
 
+    reseed_stack_guard();
+
     calibrate_tsc();
     uint64_t usec_at_entry = rdtsc_usec();
 
@@ -95,7 +98,7 @@ noreturn void entry(uint8_t boot_drive, int boot_from) {
 
     init_idt();
 
-    disk_create_index();
+    disk_create_index(boot_from == BOOTED_FROM_PXE ? 0 : boot_drive);
 
     if (boot_from == BOOTED_FROM_HDD || boot_from == BOOTED_FROM_CD) {
         boot_volume = volume_get_by_bios_drive(boot_drive);

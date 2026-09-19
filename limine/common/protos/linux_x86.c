@@ -18,6 +18,8 @@
 #include <lib/fb.h>
 #include <lib/acpi.h>
 #include <sys/iommu.h>
+#include <sys/cpu.h>
+#include <sys/lapic.h>
 #include <drivers/edid.h>
 #include <drivers/vga_textmode.h>
 #include <drivers/gop.h>
@@ -33,6 +35,7 @@ noreturn void linux_spinup(void *entry, void *boot_params);
 
 #define EDD_MBR_SIG_MAX 16
 #define E820_MAX_ENTRIES_ZEROPAGE 128
+#define SETUP_E820_EXT 1
 #define EDDMAXNR 6
 
 struct setup_header {
@@ -127,6 +130,13 @@ struct boot_e820_entry {
     uint64_t addr;
     uint64_t size;
     uint32_t type;
+} __attribute__((packed));
+
+struct setup_data {
+    uint64_t next;
+    uint32_t type;
+    uint32_t len;
+    uint8_t data[];
 } __attribute__((packed));
 
 struct edd_device_params {
@@ -290,6 +300,49 @@ struct boot_params {
 
 // End of Linux code
 
+#define LINUX_VER(maj, min) (((uint32_t)(maj) << 16) | (uint32_t)(min))
+
+// Returns the kernel's version as LINUX_VER(), or 0 when it cannot be read.
+// header.S always emits the pointer, so a kernel without one is not Linux.
+static uint32_t linux_version_of(struct file_handle *kernel_file,
+                                 struct setup_header *setup_header) {
+    if (setup_header->kernel_version == 0) {
+        return 0;
+    }
+
+    size_t offset = (size_t)setup_header->kernel_version + 0x200;
+    if (offset >= kernel_file->size) {
+        return 0;
+    }
+
+    char buf[32];
+    size_t avail = kernel_file->size - offset;
+    size_t len = avail < sizeof(buf) - 1 ? avail : sizeof(buf) - 1;
+    fread(kernel_file, buf, offset, len);
+    buf[len] = '\0';
+
+    uint32_t major = 0, minor = 0;
+    size_t i = 0;
+    if (buf[i] < '0' || buf[i] > '9') {
+        return 0;
+    }
+    for (; i < len && buf[i] >= '0' && buf[i] <= '9'; i++) {
+        major = major * 10 + (uint32_t)(buf[i] - '0');
+    }
+    if (i >= len || buf[i] != '.') {
+        return 0;
+    }
+    i++;
+    if (i >= len || buf[i] < '0' || buf[i] > '9') {
+        return 0;
+    }
+    for (; i < len && buf[i] >= '0' && buf[i] <= '9'; i++) {
+        minor = minor * 10 + (uint32_t)(buf[i] - '0');
+    }
+
+    return LINUX_VER(major, minor);
+}
+
 noreturn void linux_load(char *config, char *cmdline) {
     struct file_handle *kernel_file;
 
@@ -308,7 +361,9 @@ noreturn void linux_load(char *config, char *cmdline) {
         panic(true, "linux: Kernel path not specified");
     }
 
-    print("linux: Loading kernel `%#`...\n", kernel_path);
+    if (!terse) {
+        print("linux: Loading kernel `%#`...\n", kernel_path);
+    }
 
     if ((kernel_file = uri_open(kernel_path, MEMMAP_BOOTLOADER_RECLAIMABLE,
 #if defined (__i386__)
@@ -364,19 +419,30 @@ noreturn void linux_load(char *config, char *cmdline) {
         panic(true, "linux: Kernel file too small for setup header");
     }
 
+    // The zero page only reserves up to edd_mbr_sig_buffer for the setup
+    // header, so a longer one cannot be copied in without overwriting fields
+    // past it.
+    if (setup_header_end > offsetof(struct boot_params, edd_mbr_sig_buffer)) {
+        panic(true, "linux: Setup header too long for the zero page");
+    }
+
     fread(kernel_file, setup_header, 0x1f1, setup_header_end - 0x1f1);
 
     printv("linux: Boot protocol: %u.%u\n",
            setup_header->version >> 8, setup_header->version & 0xff);
 
-    if (setup_header->version < 0x203) {
-        panic(true, "linux: Protocols < 2.03 are not supported");
+    if (setup_header->version < 0x202) {
+        panic(true, "linux: Protocols < 2.02 are not supported");
     }
 
     setup_header->cmd_line_ptr = (uint32_t)(uintptr_t)cmdline;
 
     // vid_mode. 0xffff means "normal"
     setup_header->vid_mode = 0xffff;
+
+    // Read while the file is still open; it is consulted after the handoff
+    // quirks below, long after fclose().
+    uint32_t linux_ver = linux_version_of(kernel_file, setup_header);
 
     if (verbose) {
         char *kernel_version = ext_mem_alloc(128);
@@ -415,17 +481,41 @@ noreturn void linux_load(char *config, char *cmdline) {
     // Start at pref_address: the decompressor relocates itself up to
     // LOAD_PHYSICAL_ADDR (= pref_address) and scribbles init_size bytes from
     // there, so loading below it would leave that range unreserved.
+    // XLF_KERNEL_64 with XLF_CAN_BE_LOADED_ABOVE_4G is the kernel saying it has a
+    // 64-bit entry point and may sit above 4GiB; otherwise the handoff is 32-bit.
+    uint64_t kernel_addr_limit = 0xffffffff;
+#if defined (UEFI) && defined (__x86_64__)
+    // xloadflags only exists from 2.12; below that the field is padding.
+    bool xlf_64bit_entry = setup_header->version >= 0x20c
+                        && (setup_header->xloadflags & 3) == 3;
+
+    if (xlf_64bit_entry) {
+        kernel_addr_limit = UINT64_MAX;
+    }
+#endif
     uintptr_t kernel_search_start = 0x100000;
     if (setup_header->version >= 0x20a
      && setup_header->pref_address >= 0x100000
-     && setup_header->pref_address + (uint64_t)kernel_alloc_size <= UINTPTR_MAX) {
+     && kernel_alloc_size <= kernel_addr_limit
+     && setup_header->pref_address <= kernel_addr_limit - kernel_alloc_size) {
         kernel_search_start = (uintptr_t)setup_header->pref_address;
     }
     // Non-relocatable kernels must be loaded at their required address; do
     // not step up on failure.
     bool relocatable_kernel = setup_header->version >= 0x205
                            && setup_header->relocatable_kernel != 0;
+    // The walk gets the ceiling the search start already has, so that both ends
+    // of the range agree about what the handoff can express.
+    uint64_t kernel_addr_max = 0;
+    if (kernel_alloc_size <= kernel_addr_limit) {
+        kernel_addr_max = kernel_addr_limit - kernel_alloc_size;
+    }
     uintptr_t kernel_load_addr = ALIGN_UP(kernel_search_start, kernel_align, panic(true, "linux: Alignment overflow"));
+    // The loop bounds each step, not the address the walk starts from, and
+    // aligning up can pass the ceiling the search start was checked against.
+    if ((uint64_t)kernel_load_addr > kernel_addr_max) {
+        panic(true, "linux: Failed to allocate memory for kernel");
+    }
     for (;;) {
         if (memmap_alloc_range(kernel_load_addr,
                 ALIGN_UP(kernel_alloc_size, 4096, panic(true, "linux: Alignment overflow")),
@@ -436,12 +526,23 @@ noreturn void linux_load(char *config, char *cmdline) {
             panic(true, "linux: Non-relocatable kernel could not be loaded at required address %X", (uint64_t)kernel_load_addr);
         }
 
-        if (kernel_load_addr >= 0xfff00000) {
+        // The first bound is not a multiple of the alignment, so the step can
+        // pass it rather than land on it; the second is what the handoff can
+        // express, and passing that is what truncates the address to zero.
+        if (kernel_load_addr >= 0xfff00000
+         || (uint64_t)kernel_load_addr + kernel_align > kernel_addr_max) {
             panic(true, "linux: Failed to allocate memory for kernel");
         }
 
-        kernel_load_addr += kernel_align;
+        kernel_load_addr = CHECKED_ADD(kernel_load_addr, kernel_align,
+                panic(true, "linux: Failed to allocate memory for kernel"));
     }
+
+#if defined (UEFI) && defined (__x86_64__)
+    if (kernel_load_addr > 0xffffffff) {
+        use_64_bit_proto = true;
+    }
+#endif
 
     fread(kernel_file, (void *)kernel_load_addr, real_mode_code_size, kernel_file->size - real_mode_code_size);
 
@@ -476,7 +577,9 @@ noreturn void linux_load(char *config, char *cmdline) {
         if (module_path == NULL)
             break;
 
-        print("linux: Loading module `%#`...\n", module_path);
+        if (!terse) {
+            print("linux: Loading module `%#`...\n", module_path);
+        }
 
         struct file_handle *module;
         if ((module = uri_open(module_path, MEMMAP_BOOTLOADER_RECLAIMABLE,
@@ -516,7 +619,7 @@ noreturn void linux_load(char *config, char *cmdline) {
     for (;;) {
         if (modules_mem_base < 0x100000) {
 #if defined (UEFI) && defined (__x86_64__)
-            if ((setup_header->xloadflags & 3) == 3) {
+            if (xlf_64bit_entry) {
                 modules_mem_base = (uintptr_t)ext_mem_alloc_type_aligned_mode(
                     size_of_all_modules,
                     MEMMAP_BOOTLOADER_RECLAIMABLE,
@@ -621,7 +724,7 @@ set_textmode:;
         screen_info->orig_video_isVGA = VIDEO_TYPE_VGAC;
 #endif
     } else {
-        screen_info->capabilities   = VIDEO_CAPABILITY_64BIT_BASE | VIDEO_CAPABILITY_SKIP_QUIRKS;
+        screen_info->capabilities   = VIDEO_CAPABILITY_64BIT_BASE;
         screen_info->flags          = VIDEO_FLAGS_NOCURSOR;
         screen_info->lfb_base       = (uint32_t)fbs[0].framebuffer_addr;
         screen_info->ext_lfb_base   = (uint32_t)(fbs[0].framebuffer_addr >> 32);
@@ -659,6 +762,24 @@ no_fb:;
     boot_params->acpi_rsdp_addr = (uintptr_t)acpi_get_rsdp();
 
     ///////////////////////////////////////
+    // e820 overflow table
+    ///////////////////////////////////////
+
+    // Finalising the memory map closes the allocator, and on UEFI that cannot
+    // happen until after ExitBootServices, so reserve the table up front.
+    struct setup_data *e820_ext = NULL;
+    size_t e820_ext_max = 0;
+
+    if (setup_header->version >= 0x209) {
+        size_t max_entries = get_raw_memmap_max_entries();
+        if (max_entries > E820_MAX_ENTRIES_ZEROPAGE) {
+            e820_ext_max = max_entries - E820_MAX_ENTRIES_ZEROPAGE;
+            e820_ext = ext_mem_alloc(sizeof(struct setup_data)
+                                     + e820_ext_max * sizeof(struct boot_e820_entry));
+        }
+    }
+
+    ///////////////////////////////////////
     // UEFI
     ///////////////////////////////////////
 #if defined (UEFI)
@@ -691,32 +812,67 @@ no_fb:;
     size_t mmap_entries;
     struct memmap_entry *mmap = get_raw_memmap(&mmap_entries);
 
-    for (size_t i = 0, j = 0; i < mmap_entries; i++) {
+    struct boot_e820_entry *e820_ext_table = e820_ext == NULL
+        ? NULL : (struct boot_e820_entry *)e820_ext->data;
+    size_t j = 0, k = 0;
+
+    for (size_t i = 0; i < mmap_entries; i++) {
         if (mmap[i].type >= 0x1000) {
             continue;
         }
-        if (j >= E820_MAX_ENTRIES_ZEROPAGE) {
+
+        struct boot_e820_entry *entry;
+        if (j < E820_MAX_ENTRIES_ZEROPAGE) {
+            entry = &e820_table[j++];
+            boot_params->e820_entries = j;
+        } else if (k < e820_ext_max) {
+            entry = &e820_ext_table[k++];
+        } else {
             panic(false, "linux: Too many E820 memory map entries");
         }
-        e820_table[j].addr = mmap[i].base;
-        e820_table[j].size = mmap[i].length;
-        e820_table[j].type = mmap[i].type;
-        j++;
-        boot_params->e820_entries = j;
+
+        entry->addr = mmap[i].base;
+        entry->size = mmap[i].length;
+        entry->type = mmap[i].type;
+    }
+
+    if (k > 0) {
+        // The list may already have entries, so link in front of them.
+        e820_ext->next = setup_header->setup_data;
+        e820_ext->type = SETUP_E820_EXT;
+        e820_ext->len = k * sizeof(struct boot_e820_entry);
+        setup_header->setup_data = (uintptr_t)e820_ext;
     }
 
     ///////////////////////////////////////
     // Spin up
     ///////////////////////////////////////
 
-    // Commented out because Linux shouldn't need it and we don't want to
-    // introduce potential breakages or security weakening.
-    //iommu_disable_all();
+    // Linux enables x2APIC itself where it wants it, but a kernel built without
+    // CONFIG_X86_X2APIC that is entered in x2APIC mode gives up the APIC
+    // entirely, so hand over in xAPIC mode.
+    if (rdmsr(0x1b) & (1 << 10)) {
+        if (x2apic_disable()) {
+            printv("linux: Firmware had x2APIC enabled, reverted to xAPIC mode\n");
+        } else {
+            printv("linux: Firmware has x2APIC enabled and it could not be disabled\n");
+        }
+    }
+
+    // Taking over an IOMMU left enabled at entry arrived in 4.2 for VT-d and in
+    // 4.14 for AMD-Vi. Leave it to newer kernels, which keeps the firmware's DMA
+    // protection up across the handoff.
+    if (linux_ver < LINUX_VER(4, 2)) {
+        vtd_disable_all();
+    }
+    if (linux_ver < LINUX_VER(4, 14)) {
+        amdvi_disable_all();
+    }
 
     irq_flush_type = IRQ_PIC_ONLY_FLUSH;
 
 #if defined (UEFI) && defined (__x86_64__)
-    if (use_64_bit_proto == true && (setup_header->xloadflags & 3) == 3) {
+    if (use_64_bit_proto == true && xlf_64bit_entry) {
         flush_irqs();
         linux_spinup64((void *)kernel_load_addr + 0x200, boot_params);
     }

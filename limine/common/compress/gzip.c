@@ -4,29 +4,6 @@
  * file only wires pdgzip's streaming read-callback API into Limine's
  * file_handle abstraction and adds support for random-access reads via
  * rewind-and-skip.
- *
- * Copyright (C) 2019-2026 Mintsuki and contributors.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
 #include <stdint.h>
@@ -106,13 +83,6 @@ static void gzip_close(struct file_handle * file) {
   fclose(gh->source);
   pmm_free(gh->scratch, gh->scratch_sz);
   pmm_free(gh, sizeof(struct gzip_handle));
-}
-
-bool gzip_check(struct file_handle * fd) {
-  if (fd->size < 18) return false;
-  uint8_t magic[2];
-  if (fread(fd, magic, 0, 2) != 2) return false;
-  return magic[0] == 0x1F && magic[1] == 0x8B;
 }
 
 struct file_handle * gzip_open(struct file_handle * compressed) {

@@ -10,6 +10,7 @@
 #include <lib/uri.h>
 #include <lib/bli.h>
 #include <lib/rng_seed.h>
+#include <lib/term.h>
 #include <lib/tpm.h>
 #include <fs/file.h>
 #include <mm/pmm.h>
@@ -76,6 +77,18 @@ void prepare_spinup_tramp(void) {
 
     spinup_tramp_buf = ext_mem_alloc(total);
     spinup_tramp_off = 0;
+
+    // spinup_go32 runs from here in compatibility mode, before it turns paging
+    // off, so the firmware page tables still govern it. An EfiLoaderCode
+    // allocation is not on its own a promise that the pages are executable.
+    EFI_GUID mem_attr_guid = EFI_MEMORY_ATTRIBUTE_PROTOCOL_GUID;
+    EFI_MEMORY_ATTRIBUTE_PROTOCOL *mem_attr = NULL;
+    if (gBS->LocateProtocol(&mem_attr_guid, NULL, (void **)&mem_attr) == EFI_SUCCESS) {
+        mem_attr->ClearMemoryAttributes(mem_attr,
+            (EFI_PHYSICAL_ADDRESS)(uintptr_t)spinup_tramp_buf,
+            ALIGN_UP(total, 4096, panic(false, "spinup: trampoline overflow")),
+            EFI_MEMORY_XP);
+    }
 
     spinup_low_go32 = (uintptr_t)spinup_stow(spinup_go32, spinup_go32_end);
 
@@ -199,7 +212,7 @@ size_t get_trailing_zeros(uint64_t val) {
 }
 
 void *get_device_tree_blob(const char *config, size_t extra_size,
-                           bool measure) {
+                           bool measure, bool required) {
     int ret;
 
     size_t size = 0;
@@ -217,32 +230,45 @@ void *get_device_tree_blob(const char *config, size_t extra_size,
             soft_panic = false;
         }
         if (dtb_path != NULL) {
-            struct file_handle *dtb_file;
-            if ((dtb_file = uri_open(dtb_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false
+            // A URI the parser refuses panics whatever required says, since
+            // ignoring one would silently drop a hash the config asked for.
+            struct file_handle *dtb_file = uri_open(dtb_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false
 #if defined (__i386__)
                 , NULL, NULL
 #endif
-            )) == NULL)
+            );
+
+            if (dtb_file == NULL && required) {
                 panic(soft_panic, "dtb: Failed to open device tree blob with path `%#`. Is the path correct?", dtb_path);
-
-            dtb = dtb_file->fd;
-            size = dtb_file->size;
-            fclose(dtb_file);
-
-            ret = fdt_check_full(dtb, size);
-            if (ret != 0) {
-                panic(soft_panic, "dtb: Invalid device tree blob at `%#`: '%s'", dtb_path, fdt_strerror(ret));
             }
 
+            if (dtb_file != NULL) {
+                dtb = dtb_file->fd;
+                size = dtb_file->size;
+                fclose(dtb_file);
+
+                ret = fdt_check_full(dtb, size);
+                if (ret != 0) {
+                    if (required) {
+                        panic(soft_panic, "dtb: Invalid device tree blob at `%#`: '%s'", dtb_path, fdt_strerror(ret));
+                    }
+                    pmm_free(dtb, size);
+                    dtb = NULL;
+                    size = 0;
+                }
+            }
+
+            if (dtb != NULL) {
 #if defined (UEFI)
-            if (measure) {
-                tpm_measure_path(TPM_PCR_BOOT_AUTH, TPM_EV_IPL, "dtb_path: ", dtb_path);
-                tpm_measure(TPM_PCR_LOADED_IMAGES, TPM_EV_IPL,
-                            dtb, size, "dtb_path: ", dtb_path);
-            }
+                if (measure) {
+                    tpm_measure_path(TPM_PCR_BOOT_AUTH, TPM_EV_IPL, "dtb_path: ", dtb_path);
+                    tpm_measure(TPM_PCR_LOADED_IMAGES, TPM_EV_IPL,
+                                dtb, size, "dtb_path: ", dtb_path);
+                }
 #endif
 
-            printv("dtb: loaded dtb at %p from file `%#`\n", dtb, dtb_path);
+                printv("dtb: loaded dtb at %p from file `%#`\n", dtb, dtb_path);
+            }
         }
     }
 
@@ -261,9 +287,15 @@ void *get_device_tree_blob(const char *config, size_t extra_size,
             dtb = ext_mem_alloc(size);
             ret = fdt_open_into(cur_table->VendorTable, dtb, size);
             if (ret < 0) {
-                panic(true, "dtb: failed to resize new DTB");
+                if (required) {
+                    panic(true, "dtb: failed to resize new DTB");
+                }
+                pmm_free(dtb, size);
+                dtb = NULL;
+                size = 0;
+            } else {
+                printv("dtb: found dtb at %p via EFI\n", cur_table->VendorTable);
             }
-            printv("dtb: found dtb at %p via EFI\n", cur_table->VendorTable);
             break;
         }
     }
@@ -284,7 +316,12 @@ void *get_device_tree_blob(const char *config, size_t extra_size,
 
         ret = fdt_open_into(dtb, new_tab, new_size);
         if (ret < 0) {
-            panic(true, "dtb: failed to resize new DTB");
+            if (required) {
+                panic(true, "dtb: failed to resize new DTB");
+            }
+            pmm_free(new_tab, new_size);
+            pmm_free(dtb, size);
+            return NULL;
         }
 
         pmm_free(dtb, size);
@@ -363,6 +400,10 @@ bool efi_exit_boot_services(void) {
     // publish it for the kernel to mix into its early RNG state.
     rng_seed_install();
 
+    // Every path past this point ends with the allocator locked out, and
+    // panic() reaches term_fallback(), so build its terminal now.
+    term_prepare_post_ebs();
+
     // Free the buffer init_memmap left us; the loop below manages
     // allocation lifetime itself.
     status = gBS->FreePool(efi_mmap);
@@ -385,6 +426,12 @@ bool efi_exit_boot_services(void) {
         efi_mmap_size = efi_mmap_alloc;
         status = gBS->GetMemoryMap(&efi_mmap_size, efi_mmap, &efi_mmap_key,
                                    &efi_desc_size, &efi_desc_ver);
+
+        // The rebuild strides by this call's size, not an earlier call's.
+        if (efi_desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) {
+            goto fail;
+        }
+
         if (status == EFI_BUFFER_TOO_SMALL) {
             // Map grew (or first iteration). Free both buffers and
             // reallocate, with slack for the descriptors AllocatePool
@@ -403,7 +450,12 @@ bool efi_exit_boot_services(void) {
             if (status) {
                 goto fail;
             }
-            efi_copy_alloc = CHECKED_MUL(efi_mmap_alloc, (UINTN)2, goto fail);
+            // Cutting a descriptor at both edges of every region we own can
+            // add two descriptors per region on top of the firmware's own.
+            UINTN split_slack = CHECKED_MUL((UINTN)untouched_memmap_entries, (UINTN)2, goto fail);
+            split_slack = CHECKED_MUL(split_slack, efi_desc_size, goto fail);
+            efi_copy_alloc = CHECKED_ADD(CHECKED_MUL(efi_mmap_alloc, (UINTN)2, goto fail),
+                                         split_slack, goto fail);
             status = gBS->AllocatePool(EfiLoaderData, efi_copy_alloc,
                                        (void **)&efi_copy);
             if (status) {
@@ -418,6 +470,9 @@ bool efi_exit_boot_services(void) {
         // Be gone, UEFI!
         status = gBS->ExitBootServices(efi_image_handle, efi_mmap_key);
         if (status == EFI_SUCCESS) {
+            // The map rebuild below can panic, and term_fallback() picks its
+            // backend off this flag: the console protocol is already gone.
+            efi_boot_services_exited = true;
             break;
         }
         // Map key invalidated by an allocation - retry.
@@ -444,99 +499,64 @@ bool efi_exit_boot_services(void) {
 
     for (size_t i = 0; i < entry_count; i++) {
         EFI_MEMORY_DESCRIPTOR *orig_entry = (void *)efi_mmap + i * efi_desc_size;
-        EFI_MEMORY_DESCRIPTOR *new_entry = (void *)efi_copy + efi_copy_i * efi_desc_size;
 
         if (orig_entry->NumberOfPages == 0) {
             continue;
         }
 
-        memcpy(new_entry, orig_entry, efi_desc_size);
-
         uint64_t base = orig_entry->PhysicalStart;
-        uint64_t length = orig_entry->NumberOfPages * 4096;
-        uint64_t top = base + length;
+        uint64_t top = base + orig_entry->NumberOfPages * 4096;
 
-        // Find for a match in the untouched memory map
-        for (size_t j = 0; j < untouched_memmap_entries; j++) {
-            if (untouched_memmap[j].type != MEMMAP_USABLE)
-                continue;
+        // Emit the descriptor in runs, cut wherever it crosses the edge of a
+        // region we own. Firmware is free to describe several of our regions
+        // with one descriptor, so matching just one of them would leave the
+        // others held as loader memory.
+        for (uint64_t cur = base; cur < top;) {
+            uint64_t run_top = top;
+            bool owned = false;
 
-            if (top > untouched_memmap[j].base && top <= untouched_memmap[j].base + untouched_memmap[j].length) {
-                if (untouched_memmap[j].base < base) {
-                    new_entry->NumberOfPages = (base - untouched_memmap[j].base) / 4096;
+            for (size_t j = 0; j < untouched_memmap_entries; j++) {
+                if (untouched_memmap[j].type != MEMMAP_USABLE)
+                    continue;
 
-                    efi_copy_i++;
-                    if (efi_copy_i == EFI_COPY_MAX_ENTRIES) {
-                        panic(false, "efi: New memory map exhausted");
+                uint64_t reg_base = untouched_memmap[j].base;
+                uint64_t reg_top = CHECKED_ADD(reg_base, untouched_memmap[j].length, continue);
+
+                if (cur >= reg_base && cur < reg_top) {
+                    owned = true;
+                    if (reg_top < run_top) {
+                        run_top = reg_top;
                     }
-                    new_entry = (void *)efi_copy + efi_copy_i * efi_desc_size;
-                    memcpy(new_entry, orig_entry, efi_desc_size);
-
-                    new_entry->NumberOfPages -= (base - untouched_memmap[j].base) / 4096;
-                    new_entry->PhysicalStart = base;
-                    new_entry->VirtualStart = 0;
-
-                    length = new_entry->NumberOfPages * 4096;
-                    top = base + length;
-                }
-
-                if (untouched_memmap[j].base > base) {
-                    new_entry->NumberOfPages = (untouched_memmap[j].base - base) / 4096;
-
-                    efi_copy_i++;
-                    if (efi_copy_i == EFI_COPY_MAX_ENTRIES) {
-                        panic(false, "efi: New memory map exhausted");
-                    }
-                    new_entry = (void *)efi_copy + efi_copy_i * efi_desc_size;
-                    memcpy(new_entry, orig_entry, efi_desc_size);
-
-                    new_entry->NumberOfPages -= (untouched_memmap[j].base - base) / 4096;
-                    new_entry->PhysicalStart = untouched_memmap[j].base;
-                    new_entry->VirtualStart = 0;
-
-                    base = new_entry->PhysicalStart;
-                    length = new_entry->NumberOfPages * 4096;
-                    top = base + length;
-                }
-
-                if (length < untouched_memmap[j].length) {
-                    panic(false, "efi: Memory map corruption");
-                }
-
-                new_entry->Type = EfiConventionalMemory;
-
-                if (length == untouched_memmap[j].length) {
-                    // It's a perfect match!
                     break;
                 }
 
-                new_entry->NumberOfPages = untouched_memmap[j].length / 4096;
-
-                efi_copy_i++;
-                if (efi_copy_i == EFI_COPY_MAX_ENTRIES) {
-                    panic(false, "efi: New memory map exhausted");
+                if (reg_base > cur && reg_base < run_top) {
+                    run_top = reg_base;
                 }
-                new_entry = (void *)efi_copy + efi_copy_i * efi_desc_size;
-                memcpy(new_entry, orig_entry, efi_desc_size);
-
-                new_entry->NumberOfPages = (length - untouched_memmap[j].length) / 4096;
-                new_entry->PhysicalStart = base + untouched_memmap[j].length;
-                new_entry->VirtualStart = 0;
-
-                break;
             }
-        }
 
-        efi_copy_i++;
-        if (efi_copy_i == EFI_COPY_MAX_ENTRIES) {
-            panic(false, "efi: New memory map exhausted");
+            EFI_MEMORY_DESCRIPTOR *new_entry = (void *)efi_copy + efi_copy_i * efi_desc_size;
+            memcpy(new_entry, orig_entry, efi_desc_size);
+            new_entry->PhysicalStart = cur;
+            new_entry->NumberOfPages = (run_top - cur) / 4096;
+            if (owned) {
+                new_entry->Type = EfiConventionalMemory;
+            }
+            if (cur != base) {
+                new_entry->VirtualStart = 0;
+            }
+
+            efi_copy_i++;
+            if (efi_copy_i == EFI_COPY_MAX_ENTRIES) {
+                panic(false, "efi: New memory map exhausted");
+            }
+
+            cur = run_top;
         }
     }
 
     efi_mmap = efi_copy;
     efi_mmap_size = efi_copy_i * efi_desc_size;
-
-    efi_boot_services_exited = true;
 
     printv("efi: Exited boot services.\n");
 

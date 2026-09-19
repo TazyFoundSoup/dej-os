@@ -111,35 +111,65 @@ static struct iso9660_contexts_node *contexts = NULL;
 // Maximum directory size to prevent memory exhaustion (64MB)
 #define ISO9660_MAX_DIR_SIZE (64 * 1024 * 1024)
 
-static void iso9660_find_PVD(struct iso9660_primary_volume *desc, struct volume *vol) {
+// The dispatcher tries each filesystem in turn, so failing to find a primary
+// volume descriptor just means this is not the one.
+static bool iso9660_find_PVD(struct iso9660_primary_volume *desc, struct volume *vol) {
     uint32_t lba = ISO9660_FIRST_VOLUME_DESCRIPTOR;
     uint32_t max_lba = ISO9660_FIRST_VOLUME_DESCRIPTOR + ISO9660_MAX_VOLUME_DESCRIPTORS;
 
     while (lba < max_lba) {
         uint64_t offset = (uint64_t)lba * ISO9660_SECTOR_SIZE;
         if (!volume_read(vol, desc, offset, sizeof(struct iso9660_primary_volume))) {
-            panic(false, "ISO9660: failed to read volume descriptor");
+            return false;
+        }
+        if (memcmp(desc->volume_descriptor.identifier, "CD001", 5) != 0) {
+            return false;
         }
 
         switch (desc->volume_descriptor.type) {
         case ISO9660_VDT_PRIMARY:
-            return;
+            // ECMA-119 9.4.4 gives the primary descriptor version 1. The
+            // field is type-dependent: 9.5.3 gives an enhanced descriptor 2.
+            return desc->volume_descriptor.version == 1;
         case ISO9660_VDT_TERMINATOR:
-            panic(false, "ISO9660: no primary volume descriptor");
-            break;
+            return false;
         }
 
         ++lba;
     }
 
-    panic(false, "ISO9660: exceeded maximum volume descriptor search limit");
+    return false;
 }
 
-static void iso9660_cache_root(struct volume *vol,
+char *iso9660_get_label(struct volume *vol) {
+    struct iso9660_primary_volume pv;
+    if (!iso9660_find_PVD(&pv, vol)) {
+        return NULL;
+    }
+
+    char *ret = ext_mem_alloc(sizeof(pv.volume_identifier) + 1);
+    memcpy(ret, pv.volume_identifier, sizeof(pv.volume_identifier));
+
+    // ECMA-119 8.4.7 pads the volume identifier to its full width with spaces.
+    for (int i = sizeof(pv.volume_identifier) - 1; i >= 0; i--) {
+        if (ret[i] != ' ') {
+            break;
+        }
+        ret[i] = 0;
+    }
+
+    return ret;
+}
+
+// fopen() tries this on every volume before FAT, so a descriptor that does not
+// describe a filesystem we can read has to decline rather than end the boot.
+static bool iso9660_cache_root(struct volume *vol,
                                void **root,
                                uint32_t *root_size) {
     struct iso9660_primary_volume pv;
-    iso9660_find_PVD(&pv, vol);
+    if (!iso9660_find_PVD(&pv, vol)) {
+        return false;
+    }
 
     *root_size = pv.root.extent_size.little;
 
@@ -147,14 +177,17 @@ static void iso9660_cache_root(struct volume *vol,
     // sector alignment so directory-traversal sector-skip arithmetic is sound.
     if (*root_size == 0 || *root_size > ISO9660_MAX_DIR_SIZE
      || *root_size % ISO9660_SECTOR_SIZE != 0) {
-        panic(false, "ISO9660: Invalid root directory size");
+        return false;
     }
 
     *root = ext_mem_alloc(*root_size);
     uint64_t offset = (uint64_t)pv.root.extent.little * ISO9660_SECTOR_SIZE;
     if (!volume_read(vol, *root, offset, *root_size)) {
-        panic(false, "ISO9660: failed to read root directory");
+        pmm_free(*root, *root_size);
+        return false;
     }
+
+    return true;
 }
 
 static struct iso9660_context *iso9660_get_context(struct volume *vol) {
@@ -168,7 +201,10 @@ static struct iso9660_context *iso9660_get_context(struct volume *vol) {
     // The context is not cached at this point
     struct iso9660_contexts_node *node = ext_mem_alloc(sizeof(struct iso9660_contexts_node));
     node->context.vol = vol;
-    iso9660_cache_root(vol, &node->context.root, &node->context.root_size);
+    if (!iso9660_cache_root(vol, &node->context.root, &node->context.root_size)) {
+        pmm_free(node, sizeof(struct iso9660_contexts_node));
+        return NULL;
+    }
 
     node->next = contexts;
     contexts = node;
@@ -362,6 +398,10 @@ struct file_handle *iso9660_open(struct volume *vol, const char *path) {
     struct iso9660_file_handle *ret = ext_mem_alloc(sizeof(struct iso9660_file_handle));
 
     ret->context = iso9660_get_context(vol);
+    if (ret->context == NULL) {
+        pmm_free(ret, sizeof(struct iso9660_file_handle));
+        return NULL;
+    }
 
     while (*path == '/')
         ++path;

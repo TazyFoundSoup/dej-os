@@ -30,7 +30,8 @@ bool efi_exit_boot_services(void);
 bool is_efi_serial_present(void);
 #endif
 
-void *get_device_tree_blob(const char *config, size_t extra_size, bool measure);
+void *get_device_tree_blob(const char *config, size_t extra_size, bool measure,
+                           bool required);
 
 extern struct volume *boot_volume;
 
@@ -38,7 +39,14 @@ extern struct volume *boot_volume;
 extern bool stage3_loaded;
 #endif
 
-extern bool quiet, serial, editor_enabled, help_hidden, hash_mismatch_panic, secure_boot_active, measured_boot, firmware_logo;
+extern uintptr_t __stack_chk_guard;
+void reseed_stack_guard(void);
+
+extern bool quiet, terse, serial, editor_enabled, help_hidden, hash_mismatch_panic, secure_boot_active, measured_boot, firmware_logo;
+
+// What is drawn rather than where it goes: a COM_OUTPUT build sets this on
+// every port and transmits on BIOS alone.
+#define SERIAL_CONSOLE (serial || COM_OUTPUT)
 
 extern uint64_t usec_at_bootloader_entry;
 
@@ -57,7 +65,7 @@ noreturn void panic(bool allow_menu, const char *fmt, ...);
 
 int pit_sleep_and_quit_on_keypress(int seconds);
 int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds);
-int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds, bool deliver_mouse_moves);
+int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds);
 
 uint64_t strtoui(const char *s, const char **end, int base);
 

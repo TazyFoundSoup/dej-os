@@ -59,4 +59,4 @@ extern DEFINE_PERCPU(uint64_t, cpu_id);
 
 #define MAX_CPUS 64
 
-static uint8_t *cpu_percpu[MAX_CPUS];       // pointer to all cpus data or something
+extern uint8_t *cpu_percpu[MAX_CPUS];       // pointer to all cpus data or something

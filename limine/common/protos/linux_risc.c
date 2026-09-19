@@ -132,7 +132,9 @@ static void load_module(struct boot_param *p, char *config) {
     for (size_t i = 0; i < module_count; i++) {
         char *module_path = config_get_value(config, i, "MODULE_PATH");
 
-        print("linux: Loading module `%#`...\n", module_path);
+        if (!terse) {
+            print("linux: Loading module `%#`...\n", module_path);
+        }
 
         struct file_handle *module_file = uri_open(module_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false);
         if (!module_file) {
@@ -183,7 +185,8 @@ static void prepare_device_tree_blob(struct boot_param *p) {
     // Delete all /memory@... nodes. Linux will use the given UEFI memory map
     // instead.
     while (true) {
-        int offset = fdt_subnode_offset_namelen(dtb, 0, "memory@", 7);
+        // libfdt matches a unit address only if this name has no `@`.
+        int offset = fdt_subnode_offset_namelen(dtb, 0, "memory", 6);
 
         if (offset == -FDT_ERR_NOTFOUND) {
             break;
@@ -240,7 +243,7 @@ static void add_framebuffer(struct fb_info *fb) {
     }
     memset(screen_info, 0, sizeof(*screen_info));
 
-    screen_info->capabilities   = VIDEO_CAPABILITY_64BIT_BASE | VIDEO_CAPABILITY_SKIP_QUIRKS;
+    screen_info->capabilities   = VIDEO_CAPABILITY_64BIT_BASE;
     screen_info->flags          = VIDEO_FLAGS_NOCURSOR;
     screen_info->lfb_base       = (uint32_t)fb->framebuffer_addr;
     screen_info->ext_lfb_base   = (uint32_t)(fb->framebuffer_addr >> 32);
@@ -282,7 +285,8 @@ static void prepare_efi_tables(struct boot_param *p, char *config) {
 
         term_notready();
 
-        fb_init(&fbs, &fbs_count, req_width, req_height, req_bpp, false, false);
+        fb_init(&fbs, &fbs_count, req_width, req_height, req_bpp,
+                !fb_flush_reliable(), false);
 
         // TODO(qookie): Let the user pick a framebuffer if there's > 1
         if (fbs_count > 0) {
@@ -425,21 +429,36 @@ noreturn static void jump_to_kernel(struct boot_param *p) {
 
     asm ("msr daifset, 0xF");
 
-    // Disable MMU
+    // Disable MMU. A load issued after this takes the Device-nGnRnE attribute
+    // and need not return what was written cacheably, so the handoff registers
+    // are read here and nothing is read from memory again.
     if (current_el() == 2) {
         uint64_t sctlr;
         asm volatile ("mrs %0, sctlr_el2" : "=r"(sctlr));
         sctlr &= ~1;
-        asm volatile ("msr sctlr_el2, %0" :: "r"(sctlr));
+        asm volatile ("msr sctlr_el2, %0\n\t"
+                      "isb\n\t"
+                      "mov x0, %1\n\t"
+                      "mov x1, xzr\n\t"
+                      "mov x2, xzr\n\t"
+                      "mov x3, xzr\n\t"
+                      "br %2"
+                      :: "r"(sctlr), "r"((uint64_t)p->dtb), "r"(kernel_entry)
+                      : "x0", "x1", "x2", "x3", "memory");
     } else {
         uint64_t sctlr;
         asm volatile ("mrs %0, sctlr_el1" : "=r"(sctlr));
         sctlr &= ~1;
-        asm volatile ("msr sctlr_el1, %0" :: "r"(sctlr));
+        asm volatile ("msr sctlr_el1, %0\n\t"
+                      "isb\n\t"
+                      "mov x0, %1\n\t"
+                      "mov x1, xzr\n\t"
+                      "mov x2, xzr\n\t"
+                      "mov x3, xzr\n\t"
+                      "br %2"
+                      :: "r"(sctlr), "r"((uint64_t)p->dtb), "r"(kernel_entry)
+                      : "x0", "x1", "x2", "x3", "memory");
     }
-    asm volatile ("isb");
-
-    kernel_entry((uint64_t)p->dtb, 0, 0, 0);
 #elif defined(__loongarch__)
 // LoongArch kernel used to store virtual address in header.kernel_entry
 // clearing the high 16bits ensures compatibility
@@ -461,6 +480,8 @@ noreturn static void jump_to_kernel(struct boot_param *p) {
     struct linux_header *header = p->kernel_base;
     void (*kernel_entry)(uint64_t efi_boot, uint64_t cmdline, uint64_t st);
     kernel_entry = p->kernel_base + (TO_PHYS(header->kernel_entry) - header->load_offset);
+
+    sync_icache_range((uintptr_t)p->kernel_base, (uintptr_t)p->kernel_base + p->kernel_size);
 
     asm volatile ("csrxchg $r0, %0, 0x0" :: "r" (0x4) : "memory");
     asm volatile ("csrwr   %0,  0x180"   :: "r" (CSR_DMW0_INIT) : "memory");
@@ -492,7 +513,9 @@ noreturn void linux_load(char *config, char *cmdline) {
         panic(true, "linux: Kernel path not specified");
     }
 
-    print("linux: Loading kernel `%#`...\n", kernel_path);
+    if (!terse) {
+        print("linux: Loading kernel `%#`...\n", kernel_path);
+    }
 
     if ((kernel_file = uri_open(kernel_path, MEMMAP_BOOTLOADER_RECLAIMABLE, false)) == NULL) {
         panic(true, "linux: failed to open kernel `%s`. Is the path correct?", kernel_path);
@@ -561,7 +584,7 @@ noreturn void linux_load(char *config, char *cmdline) {
     }
 #endif
 
-    p.dtb = get_device_tree_blob(config, 0x1000, true);
+    p.dtb = get_device_tree_blob(config, 0x1000, true, true);
 
     prepare_device_tree_blob(&p);
 

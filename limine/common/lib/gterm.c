@@ -517,17 +517,22 @@ struct gterm_config {
     bool font_scale_is_default;
 };
 
-static void gterm_parse_config(char *config, struct gterm_config *cfg) {
-    cfg->fb_rotation = FLANTERM_FB_ROTATE_0;
+int gterm_get_rotation(char *config) {
     char *rotation_str = config_get_value(config, 0, "INTERFACE_ROTATION");
     if (rotation_str != NULL) {
         int rotation_val = strtoui(rotation_str, NULL, 10);
         switch (rotation_val) {
-            case 90: cfg->fb_rotation = FLANTERM_FB_ROTATE_90; break;
-            case 180: cfg->fb_rotation = FLANTERM_FB_ROTATE_180; break;
-            case 270: cfg->fb_rotation = FLANTERM_FB_ROTATE_270; break;
+            case 90: return FLANTERM_FB_ROTATE_90;
+            case 180: return FLANTERM_FB_ROTATE_180;
+            case 270: return FLANTERM_FB_ROTATE_270;
         }
     }
+
+    return FLANTERM_FB_ROTATE_0;
+}
+
+static void gterm_parse_config(char *config, struct gterm_config *cfg) {
+    cfg->fb_rotation = gterm_get_rotation(config);
 
     cfg->ansi_colours[0] = 0x00000000;
     cfg->ansi_colours[1] = 0x00aa0000;
@@ -702,7 +707,13 @@ config_no_load_font:;
     cfg->font_spacing = 1;
     char *font_spacing_str = config_get_value(config, 0, "TERM_FONT_SPACING");
     if (font_spacing_str != NULL) {
-        cfg->font_spacing = strtoui(font_spacing_str, NULL, 10);
+        // 640 is the narrowest framebuffer the fallback chain picks and menu.c
+        // wants 40 columns, so a glyph has 16 dots and the font is 8 of them.
+        const char *last;
+        uint64_t spacing = strtoui(font_spacing_str, &last, 10);
+        if (font_spacing_str != last && *last == 0 && spacing <= 8) {
+            cfg->font_spacing = spacing;
+        }
     }
 
     cfg->font_scale_x = 1;
@@ -711,8 +722,7 @@ config_no_load_font:;
 
     char *menu_font_scale = config_get_value(config, 0, "TERM_FONT_SCALE");
     if (menu_font_scale != NULL) {
-        parse_resolution(&cfg->font_scale_x, &cfg->font_scale_y, NULL, menu_font_scale);
-        if (cfg->font_scale_x == 0 || cfg->font_scale_y == 0
+        if (!parse_resolution(&cfg->font_scale_x, &cfg->font_scale_y, NULL, menu_font_scale)
          || cfg->font_scale_x > 8 || cfg->font_scale_y > 8) {
             cfg->font_scale_x = 1;
             cfg->font_scale_y = 1;
@@ -797,9 +807,8 @@ bool gterm_init(struct fb_info **_fbs, size_t *_fbs_count,
     }
 
 #if defined (UEFI)
-    if (serial || COM_OUTPUT) {
-        term_fallback();
-        return true;
+    if (serial || COM_OUTPUT || !fb_flush_reliable()) {
+        return false;
     }
 #endif
 
@@ -848,7 +857,7 @@ bool gterm_init(struct fb_info **_fbs, size_t *_fbs_count,
                             &default_bg_bright, &default_fg_bright,
                             cfg.font, cfg.font_width, cfg.font_height, cfg.font_spacing,
                             font_scale_x, font_scale_y,
-                            margin, cfg.fb_rotation);
+                            margin, cfg.fb_rotation, true);
 
         if (terms[terms_i] != NULL) {
             terms_i++;
@@ -869,13 +878,14 @@ bool gterm_init(struct fb_info **_fbs, size_t *_fbs_count,
 
     if (terms_i == 0) {
         pmm_free(terms, fbs_count * sizeof(void *));
+        terms = NULL;
         return false;
     }
 
     for (size_t i = 0; i < terms_i; i++) {
         struct flanterm_context *term = terms[i];
 
-        if (serial) {
+        if (SERIAL_CONSOLE) {
             term->cols = term->cols > 80 ? 80 : term->cols;
             term->rows = term->rows > 24 ? 24 : term->rows;
         }
@@ -903,7 +913,7 @@ bool gterm_init(struct fb_info **_fbs, size_t *_fbs_count,
         term->rows = min_rows;
 
         flanterm_context_reinit(term);
-        flanterm_fb_set_flush_callback(term, (void *)fb_flush);
+        flanterm_fb_set_flush_callback(term, fb_flush_cb);
     }
 
     term_backend = GTERM;

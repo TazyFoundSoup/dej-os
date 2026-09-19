@@ -49,6 +49,7 @@
 #define ELFCLASS64   0x02
 #define SHT_RELA     0x00000004
 #define SHN_UNDEF    0x00000000
+#define SHN_ABS      0x0000fff1
 #define STB_WEAK     0x00000002
 #define R_X86_64_NONE      0x00000000
 #define R_AARCH64_NONE     0x00000000
@@ -146,6 +147,12 @@ static bool elf32_validate(struct elf32_hdr *hdr) {
         panic(true, "elf: Not an IA-32 ELF file.");
     }
 
+    // The gABI naturally aligns every structure it defines within the file.
+    if (hdr->phoff % 4 != 0 || hdr->phdr_size % 4 != 0
+     || hdr->shoff % 4 != 0 || hdr->shdr_size % 4 != 0) {
+        panic(true, "elf: Header table is not naturally aligned in the file");
+    }
+
     return true;
 }
 
@@ -177,6 +184,12 @@ static bool elf64_validate(struct elf64_hdr *hdr) {
 #else
 #error Unknown architecture
 #endif
+
+    // The gABI naturally aligns every structure it defines within the file.
+    if (hdr->phoff % 8 != 0 || hdr->phdr_size % 8 != 0
+     || hdr->shoff % 8 != 0 || hdr->shdr_size % 8 != 0) {
+        panic(true, "elf: Header table is not naturally aligned in the file");
+    }
 
     return true;
 }
@@ -316,7 +329,22 @@ static void elf64_add_relocation_count(size_t *count, uint64_t add) {
     *count += (size_t)add;
 }
 
-static bool elf64_apply_relocations(uint8_t *elf, size_t file_size, struct elf64_hdr *hdr, void *buffer, uint64_t vaddr, size_t size, uint64_t slide) {
+// The relocation array and the symbol tables it resolves against depend only
+// on the file, so they are built once and applied to each segment in turn.
+struct elf64_reloc_state {
+    struct elf64_rela **relocs;
+    size_t relocs_i;
+    // RELR encodes addresses only, so an entry is synthesised per relocation.
+    struct elf64_rela *relr_pool;
+    size_t relr_count;
+    uint64_t symtab_offset;
+    uint64_t symtab_ent;
+    uint64_t symtab_size;
+    uint64_t strtab_offset;
+    uint64_t strtab_size;
+};
+
+static bool elf64_prepare_relocations(uint8_t *elf, size_t file_size, struct elf64_hdr *hdr, struct elf64_reloc_state *st) {
     if (hdr->phdr_size < sizeof(struct elf64_phdr)) {
         panic(true, "elf: phdr_size < sizeof(struct elf64_phdr)");
     }
@@ -354,6 +382,11 @@ static bool elf64_apply_relocations(uint8_t *elf, size_t file_size, struct elf64
 
         // Validate PT_DYNAMIC segment is within file bounds
         if (CHECKED_ADD(phdr->p_offset, phdr->p_filesz, return false) > file_size) {
+            return false;
+        }
+
+        // The gABI naturally aligns every structure it defines within the file.
+        if (phdr->p_offset % 8 != 0) {
             return false;
         }
 
@@ -411,16 +444,26 @@ static bool elf64_apply_relocations(uint8_t *elf, size_t file_size, struct elf64
     }
 end_of_pt_segment:
 
+    // The stride feeds both the DT_RELA and the DT_JMPREL walk, and both
+    // dereference a full struct elf64_rela at every step.
+    if (rela_ent != 0 && rela_ent < sizeof(struct elf64_rela)) {
+        panic(true, "elf: rela_ent < sizeof(struct elf64_rela)");
+    }
+
     if (rela_offset != 0) {
         if (!elf64_translate_vaddr(elf, file_size, hdr, &rela_offset, rela_size, NULL)) {
             panic(true, "elf: RELA vaddr translation failed or out of bounds");
         }
+    } else if (rela_size != 0) {
+        panic(true, "elf: DT_RELASZ without DT_RELA");
     }
 
     if (relr_offset != 0) {
         if (!elf64_translate_vaddr(elf, file_size, hdr, &relr_offset, relr_size, NULL)) {
             panic(true, "elf: RELR vaddr translation failed or out of bounds");
         }
+    } else if (relr_size != 0) {
+        panic(true, "elf: DT_RELRSZ without DT_RELR");
     }
 
     if (symtab_offset != 0) {
@@ -439,6 +482,17 @@ end_of_pt_segment:
         if (!elf64_translate_vaddr(elf, file_size, hdr, &dt_jmprel, dt_pltrelsz, NULL)) {
             panic(true, "elf: JMPREL vaddr translation failed or out of bounds");
         }
+    } else if (dt_pltrelsz != 0) {
+        panic(true, "elf: DT_PLTRELSZ without DT_JMPREL");
+    }
+
+    // Both the table and the stride, since every walk here steps by an entry
+    // size the file supplies.
+    if (rela_offset % 8 != 0 || rela_ent % 8 != 0
+     || relr_offset % 8 != 0
+     || symtab_offset % 8 != 0 || symtab_ent % 8 != 0
+     || dt_jmprel % 8 != 0) {
+        panic(true, "elf: Dynamic table is not naturally aligned in the file");
     }
 
     size_t relocs_i = 0;
@@ -458,8 +512,8 @@ end_of_pt_segment:
     }
     size_t relr_count = relocs_i;
     if (rela_size != 0) {
-        if (rela_ent < sizeof(struct elf64_rela)) {
-            panic(true, "elf: rela_ent < sizeof(struct elf64_rela)");
+        if (rela_ent == 0) {
+            panic(true, "elf: rela_size != 0 but rela_ent == 0");
         }
         if (rela_size % rela_ent != 0) {
             panic(true, "elf: rela_size not a multiple of rela_ent");
@@ -480,10 +534,14 @@ end_of_pt_segment:
     }
     struct elf64_rela **relocs = ext_mem_alloc_counted(relocs_i, sizeof(struct elf64_rela *));
 
+    struct elf64_rela *relr_pool = NULL;
     if (relr_size != 0) {
         size_t relr_i;
+        if (relr_count != 0) {
+            relr_pool = ext_mem_alloc_counted(relr_count, sizeof(struct elf64_rela));
+        }
         for (relr_i = 0; relr_i < relr_count; relr_i++) {
-            relocs[relr_i] = ext_mem_alloc(sizeof(struct elf64_rela));
+            relocs[relr_i] = &relr_pool[relr_i];
             relocs[relr_i]->r_info = R_INTERNAL_RELR;
         }
 
@@ -520,6 +578,57 @@ end_of_pt_segment:
         }
     }
 
+
+    st->relocs = relocs;
+    st->relocs_i = relocs_i;
+    st->relr_pool = relr_pool;
+    st->relr_count = relr_count;
+    st->symtab_offset = symtab_offset;
+    st->symtab_ent = symtab_ent;
+    st->symtab_size = symtab_size;
+    st->strtab_offset = strtab_offset;
+    st->strtab_size = strtab_size;
+
+    return true;
+}
+
+static void elf64_free_relocations(struct elf64_reloc_state *st) {
+    pmm_free(st->relr_pool, st->relr_count * sizeof(struct elf64_rela));
+    pmm_free(st->relocs, st->relocs_i * sizeof(struct elf64_rela *));
+}
+
+// r_offset is the executable's to choose and real toolchains emit misaligned
+// DT_RELR targets, so these go a byte at a time: riscv64 without Zicclsm and
+// loongarch64 without UAL may trap a wide unaligned access, and neither a
+// packed type nor memcpy stops one being emitted on both.
+static uint64_t reloc_load(const void *p) {
+    const volatile uint8_t *s = p;
+    uint64_t v = 0;
+
+    for (size_t i = 0; i < sizeof(v); i++) {
+        v |= (uint64_t)s[i] << (i * 8);
+    }
+
+    return v;
+}
+
+static void reloc_store(void *p, uint64_t v) {
+    volatile uint8_t *d = p;
+
+    for (size_t i = 0; i < sizeof(v); i++) {
+        d[i] = (uint8_t)(v >> (i * 8));
+    }
+}
+
+static bool elf64_apply_relocations(const struct elf64_reloc_state *st, uint8_t *elf, void *buffer, uint64_t vaddr, size_t size, uint64_t slide) {
+    struct elf64_rela **relocs = st->relocs;
+    size_t relocs_i = st->relocs_i;
+    uint64_t symtab_offset = st->symtab_offset;
+    uint64_t symtab_ent = st->symtab_ent;
+    uint64_t symtab_size = st->symtab_size;
+    uint64_t strtab_offset = st->strtab_offset;
+    uint64_t strtab_size = st->strtab_size;
+
     for (size_t i = 0; i < relocs_i; i++) {
         struct elf64_rela *relocation = relocs[i];
 
@@ -532,7 +641,7 @@ end_of_pt_segment:
             continue;
 
         // It's inside it, calculate where it is
-        uint64_t *ptr = (uint64_t *)(buffer + (relocation->r_addr - vaddr));
+        void *ptr = buffer + (relocation->r_addr - vaddr);
 
         switch (relocation->r_info) {
 #if defined (__x86_64__) || defined (__i386__)
@@ -557,12 +666,12 @@ end_of_pt_segment:
             case R_LARCH_RELATIVE:
 #endif
             {
-                *ptr = slide + relocation->r_addend;
+                reloc_store(ptr, slide + relocation->r_addend);
                 break;
             }
             case R_INTERNAL_RELR:
             {
-                *ptr += slide;
+                reloc_store(ptr, reloc_load(ptr) + slide);
                 break;
             }
 #if defined (__x86_64__) || defined (__i386__)
@@ -593,7 +702,7 @@ end_of_pt_segment:
                 struct elf64_sym *s = (void *)elf + symtab_offset + sym_offset;
                 if (s->st_shndx == SHN_UNDEF) {
                     if ((s->st_info >> 4) == STB_WEAK) {
-                        *ptr = 0;
+                        reloc_store(ptr, 0);
                         break;
                     }
                     if (strtab_size == 0) {
@@ -605,11 +714,14 @@ end_of_pt_segment:
                     }
                     panic(true, "elf: Unresolved symbol \"%S\"", elf + strtab_offset + s->st_name, (size_t)(strtab_size - s->st_name));
                 }
-                *ptr = slide + s->st_value
+                uint64_t value = s->st_value;
+                if (s->st_shndx != SHN_ABS) {
+                    value += slide;
+                }
 #if defined (__aarch64__)
-                       + relocation->r_addend
+                value += relocation->r_addend;
 #endif
-                ;
+                reloc_store(ptr, value);
                 break;
             }
 #if defined (__x86_64__) || defined (__i386__)
@@ -638,7 +750,7 @@ end_of_pt_segment:
                 struct elf64_sym *s = (void *)elf + symtab_offset + sym_offset;
                 if (s->st_shndx == SHN_UNDEF) {
                     if ((s->st_info >> 4) == STB_WEAK) {
-                        *ptr = 0;
+                        reloc_store(ptr, 0);
                         break;
                     }
                     if (strtab_size == 0) {
@@ -650,7 +762,11 @@ end_of_pt_segment:
                     }
                     panic(true, "elf: Unresolved symbol \"%S\"", elf + strtab_offset + s->st_name, (size_t)(strtab_size - s->st_name));
                 }
-                *ptr = slide + s->st_value + relocation->r_addend;
+                uint64_t value = s->st_value;
+                if (s->st_shndx != SHN_ABS) {
+                    value += slide;
+                }
+                reloc_store(ptr, value + relocation->r_addend);
                 break;
             }
             default: {
@@ -659,10 +775,6 @@ end_of_pt_segment:
         }
     }
 
-    for (size_t i = 0; i < relr_count; i++) {
-        pmm_free(relocs[i], sizeof(struct elf64_rela));
-    }
-    pmm_free(relocs, relocs_i * sizeof(struct elf64_rela *));
 
     return true;
 }
@@ -729,7 +841,14 @@ bool elf64_load_section(uint8_t *elf, size_t file_size, void *buffer, const char
                 return false;
             }
             memcpy(buffer, elf + section->sh_offset, section->sh_size);
-            return elf64_apply_relocations(elf, file_size, hdr, buffer, section->sh_addr, section->sh_size, slide);
+            struct elf64_reloc_state st;
+            if (!elf64_prepare_relocations(elf, file_size, hdr, &st)) {
+                return false;
+            }
+
+            bool ok = elf64_apply_relocations(&st, elf, buffer, section->sh_addr, section->sh_size, slide);
+            elf64_free_relocations(&st);
+            return ok;
         }
     }
 
@@ -738,6 +857,7 @@ bool elf64_load_section(uint8_t *elf, size_t file_size, void *buffer, const char
 
 static uint64_t elf64_max_align(uint8_t *elf) {
     uint64_t ret = 0;
+    size_t loadable = 0;
 
     struct elf64_hdr *hdr = (void *)elf;
 
@@ -756,13 +876,30 @@ static uint64_t elf64_max_align(uint8_t *elf) {
             panic(true, "elf: p_align is not a power of 2");
         }
 
+#if defined (__i386__)
+        // The allocator takes the alignment as a size_t, so a wider value
+        // truncates to zero and every base it computes comes out zero.
+        if (phdr->p_align > SIZE_MAX) {
+            panic(true, "elf: p_align is too large for a 32-bit port");
+        }
+#endif
+
+        loadable++;
+
         if (phdr->p_align > ret) {
             ret = phdr->p_align;
         }
     }
 
-    if (ret == 0) {
+    if (loadable == 0) {
         panic(true, "elf: Executable has no loadable segments");
+    }
+
+    // The gABI permits a p_align of 0 or 1, meaning no alignment required, but
+    // this is also the allocation and KASLR slide granularity and the pagemap
+    // is built by the page.
+    if (ret < 4096) {
+        ret = 4096;
     }
 
     return ret;
@@ -816,11 +953,15 @@ static void elf64_get_ranges(uint8_t *elf, uint64_t slide, struct mem_range **_r
         }
 
         uint64_t load_addr = phdr->p_vaddr + slide;
-        uint64_t this_top = load_addr + phdr->p_memsz;
+        uint64_t this_top = CHECKED_ADD(load_addr, phdr->p_memsz,
+            panic(true, "elf: p_vaddr + p_memsz overflow in PHDR %u", i));
 
-        uint64_t align = phdr->p_align <= 1 ? 1 : phdr->p_align;
-        ranges[r].base = load_addr & ~(align - 1);
-        ranges[r].length = ALIGN_UP(this_top - ranges[r].base, align, panic(true, "elf: Alignment overflow"));
+        // p_align is an alignment, not an extent; the gABI loads by the page.
+        uint64_t base = ALIGN_DOWN(load_addr, 4096);
+        uint64_t top = ALIGN_UP(this_top, 4096, panic(true, "elf: Alignment overflow"));
+
+        ranges[r].base = base;
+        ranges[r].length = top - base;
 
         if (phdr->p_flags & ELF_PF_X) {
             ranges[r].permissions |= MEM_RANGE_X;
@@ -888,6 +1029,9 @@ bool elf64_load(uint8_t *elf, size_t file_size, uint64_t *entry_point, uint64_t 
 
     uint64_t min_vaddr = (uint64_t)-1;
     uint64_t max_vaddr = 0;
+    uint64_t prev_top = 0;
+    uint64_t prev_rounded_top = 0;
+    uint32_t prev_flags = 0;
     for (uint16_t i = 0; i < hdr->ph_num; i++) {
         struct elf64_phdr *phdr = (void *)elf + (hdr->phoff + i * hdr->phdr_size);
 
@@ -913,52 +1057,25 @@ bool elf64_load(uint8_t *elf, size_t file_size, uint64_t *entry_point, uint64_t 
         uint64_t phdr_end = CHECKED_ADD(phdr->p_vaddr, phdr->p_memsz,
             panic(true, "elf: p_vaddr + p_memsz overflow in PHDR %u", i));
 
-        // check for overlapping phdrs
-        for (uint16_t j = 0; j < hdr->ph_num; j++) {
-            struct elf64_phdr *phdr_in = (void *)elf + (hdr->phoff + j * hdr->phdr_size);
-
-            if (phdr_in->p_type != PT_LOAD || phdr_in->p_memsz == 0) {
-                continue;
-            }
-
-            if (phdr_in->p_vaddr < FIXED_HIGHER_HALF_OFFSET_64) {
-                if (!is_reloc || !*is_reloc) {
-                    continue;
-                }
-            }
-
-            if (phdr_in == phdr) {
-                continue;
-            }
-
-            uint64_t phdr_in_end = CHECKED_ADD(phdr_in->p_vaddr, phdr_in->p_memsz,
-                panic(true, "elf: p_vaddr + p_memsz overflow in PHDR %u", j));
-
-            if ((phdr_in->p_vaddr >= phdr->p_vaddr
-              && phdr_in->p_vaddr < phdr_end)
-                ||
-                (phdr_in_end > phdr->p_vaddr
-              && phdr_in_end <= phdr_end)) {
-                panic(true, "elf: Attempted to load ELF file with overlapping PHDRs (%u and %u overlap)", i, j);
-            }
-
-            if (ranges != NULL) {
-                uint64_t page_rounded_base = ALIGN_DOWN(phdr->p_vaddr, 4096);
-                uint64_t page_rounded_top = ALIGN_UP(phdr_end, 4096, panic(true, "elf: PHDR alignment overflow"));
-                uint64_t page_rounded_base_in = ALIGN_DOWN(phdr_in->p_vaddr, 4096);
-                uint64_t page_rounded_top_in = ALIGN_UP(phdr_in_end, 4096, panic(true, "elf: PHDR alignment overflow"));
-
-                if ((page_rounded_base >= page_rounded_base_in
-                  && page_rounded_base < page_rounded_top_in)
-                   ||
-                    (page_rounded_top > page_rounded_base_in
-                  && page_rounded_top <= page_rounded_top_in)) {
-                    if ((phdr->p_flags & 0b111) != (phdr_in->p_flags & 0b111)) {
-                        panic(true, "elf: Attempted to load ELF file with PHDRs with different permissions sharing the same memory page.");
-                    }
-                }
-            }
+        // The gABI has loadable segments in ascending p_vaddr order, so one
+        // starting below the previous top overlaps it or the table is misordered.
+        // Nesting cannot hide from this: it would already have failed the pair
+        // before, so comparing against the previous segment alone suffices.
+        if (phdr->p_vaddr < prev_top) {
+            panic(true, "elf: Attempted to load ELF file with overlapping or out of order PHDRs (%u)", i);
         }
+
+        uint64_t rounded_base = ALIGN_DOWN(phdr->p_vaddr, 4096);
+
+        if (ranges != NULL
+         && rounded_base < prev_rounded_top
+         && (phdr->p_flags & 0b111) != prev_flags) {
+            panic(true, "elf: Attempted to load ELF file with PHDRs with different permissions sharing the same memory page.");
+        }
+
+        prev_top = phdr_end;
+        prev_rounded_top = ALIGN_UP(phdr_end, 4096, panic(true, "elf: PHDR alignment overflow"));
+        prev_flags = phdr->p_flags & 0b111;
 
         if (phdr->p_vaddr < min_vaddr) {
             min_vaddr = phdr->p_vaddr;
@@ -972,6 +1089,9 @@ bool elf64_load(uint8_t *elf, size_t file_size, uint64_t *entry_point, uint64_t 
     if (min_vaddr == (uint64_t)-1) {
         panic(true, "elf: No usable PHDRs exist");
     }
+
+    // Precedes the slide, which is derived from min_vaddr and must agree.
+    min_vaddr = ALIGN_DOWN(min_vaddr, 4096);
 
     if (lower_to_higher) {
         slide = FIXED_HIGHER_HALF_OFFSET_64 - min_vaddr;
@@ -1000,6 +1120,11 @@ again:
 
     uint64_t bss_size = 0;
 
+    struct elf64_reloc_state reloc_state;
+    if (!elf64_prepare_relocations(elf, file_size, hdr, &reloc_state)) {
+        panic(true, "elf: Failed to apply relocations");
+    }
+
     for (uint16_t i = 0; i < hdr->ph_num; i++) {
         struct elf64_phdr *phdr = (void *)elf + (hdr->phoff + i * hdr->phdr_size);
 
@@ -1021,7 +1146,6 @@ again:
 
         uint64_t load_addr = *physical_base + (phdr->p_vaddr - *virtual_base);
 
-#if defined (__aarch64__)
         uint64_t this_top = CHECKED_ADD(load_addr, phdr->p_memsz,
             panic(true, "elf: load_addr + p_memsz overflow"));
 
@@ -1030,7 +1154,6 @@ again:
         uint64_t align = phdr->p_align <= 1 ? 1 : phdr->p_align;
         mem_base = load_addr & ~(align - 1);
         mem_size = this_top - mem_base;
-#endif
 
         memcpy((void *)(uintptr_t)load_addr, elf + (phdr->p_offset), phdr->p_filesz);
 
@@ -1038,15 +1161,14 @@ again:
             bss_size = phdr->p_memsz - phdr->p_filesz;
         }
 
-        if (!elf64_apply_relocations(elf, file_size, hdr, (void *)(uintptr_t)load_addr, phdr->p_vaddr, phdr->p_memsz, slide)) {
+        if (!elf64_apply_relocations(&reloc_state, elf, (void *)(uintptr_t)load_addr, phdr->p_vaddr, phdr->p_memsz, slide)) {
             panic(true, "elf: Failed to apply relocations");
         }
 
-#if defined (__aarch64__)
-        clean_dcache_poc(mem_base, mem_base + mem_size);
-        inval_icache_pou(mem_base, mem_base + mem_size);
-#endif
+        sync_icache_range(mem_base, mem_base + mem_size);
     }
+
+    elf64_free_relocations(&reloc_state);
 
     if (_image_size_before_bss != NULL) {
         *_image_size_before_bss = image_size - bss_size;
@@ -1065,8 +1187,8 @@ again:
     return true;
 }
 
-bool elf32_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t *entry_point,
-                          struct elsewhere_range **ranges) {
+bool elf32_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t max_image_size,
+                          uint64_t *entry_point, struct elsewhere_range **ranges) {
     struct elf32_hdr *hdr = (void *)elf;
 
     elf32_validate(hdr);
@@ -1112,6 +1234,11 @@ bool elf32_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t *entry_point,
         panic(true, "elf: No loadable segments");
     }
     uint64_t image_size_64 = max_paddr - min_paddr;
+    // ext_mem_alloc() panics unrecoverably and this extent comes from the file,
+    // so the caller's ceiling has to be applied before the buffer is taken.
+    if (image_size_64 > max_image_size) {
+        panic(true, "elf: Image extent exceeds the load limit");
+    }
     if (image_size_64 > SIZE_MAX) {
         panic(true, "elf: Image size exceeds address space");
     }
@@ -1155,8 +1282,8 @@ bool elf32_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t *entry_point,
     return true;
 }
 
-bool elf64_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t *entry_point,
-                          struct elsewhere_range **ranges) {
+bool elf64_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t max_image_size,
+                          uint64_t *entry_point, struct elsewhere_range **ranges) {
     struct elf64_hdr *hdr = (void *)elf;
 
     elf64_validate(hdr);
@@ -1202,6 +1329,11 @@ bool elf64_load_elsewhere(uint8_t *elf, size_t file_size, uint64_t *entry_point,
         panic(true, "elf: No loadable segments");
     }
     uint64_t image_size = max_paddr - min_paddr;
+    // ext_mem_alloc() panics unrecoverably and this extent comes from the file,
+    // so the caller's ceiling has to be applied before the buffer is taken.
+    if (image_size > max_image_size) {
+        panic(true, "elf: Image extent exceeds the load limit");
+    }
     if (image_size > SIZE_MAX) {
         panic(true, "elf: Image size exceeds address space");
     }

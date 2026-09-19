@@ -20,7 +20,8 @@ directly.
 
 If checking out from the repository, run `./bootstrap` first in order to
 download the necessary [dependencies](3RDPARTY.md) and generate the configure
-script (`GNU autoconf` required).
+script (`git`, `patch` and `GNU autoconf` required, plus `GNU automake` for
+autoconf releases that do not install the auxiliary files themselves).
 
 `./configure` takes arguments and environment variables; for more information
 on these, run `./configure --help`.
@@ -41,9 +42,8 @@ make    # (or gmake where applicable)
 
 ## Installing
 
-This step will install Limine files to `share`, `include`, and `bin`
-directories in the specified prefix (default is `/usr/local`, see
-`./configure --help`.
+This step will install Limine files to `share` and `bin` directories in the
+specified prefix (default is `/usr/local`, see `./configure --help`).
 
 To install Limine, run:
 ```bash

@@ -40,7 +40,10 @@ static bool cache_block(struct volume *volume, uint64_t block) {
 
     // Clamp xfer_size to remaining sectors in volume
     if (volume->sect_count != (uint64_t)-1) {
-        uint64_t volume_sectors = volume->sect_count / (volume->sector_size / 512);
+        // Rounded up because volume_read() bounds by sect_count * 512, so it
+        // admits the bytes of a trailing sector the volume only partly owns.
+        uint64_t volume_sectors = DIV_ROUNDUP(volume->sect_count,
+            (uint64_t)(volume->sector_size / 512), return false);
         uint64_t end_sector;
         if (__builtin_add_overflow(first_sect, volume_sectors, &end_sector)) {
             end_sector = UINT64_MAX;
@@ -156,73 +159,354 @@ struct gpt_entry {
     uint16_t partition_name[36];
 } __attribute__((packed));
 
-bool gpt_get_guid(struct guid *guid, struct volume *volume) {
-    struct gpt_table_header header = {0};
+// Bitwise: this is stage 2, where a table costs more space than the loop costs
+// time over the few kilobytes a GPT occupies.
+static uint32_t crc32_update(uint32_t crc, const void *buffer, size_t count) {
+    const uint8_t *bytes = buffer;
 
+    for (size_t i = 0; i < count; i++) {
+        crc ^= bytes[i];
+        for (int bit = 0; bit < 8; bit++) {
+            crc = (crc & 1) ? (crc >> 1) ^ 0xedb88320 : crc >> 1;
+        }
+    }
+
+    return crc;
+}
+
+// Streamed so a header claiming a whole block, or an entry array, needs no
+// buffer of its own.
+static bool crc32_volume_range(struct volume *volume, uint64_t loc,
+                               uint64_t count, uint32_t *crc) {
+    uint8_t chunk[512];
+
+    while (count > 0) {
+        uint64_t step = count < sizeof(chunk) ? count : sizeof(chunk);
+        if (!volume_read(volume, chunk, loc, step)) {
+            return false;
+        }
+        *crc = crc32_update(*crc, chunk, step);
+        loc += step;
+        count -= step;
+    }
+
+    return true;
+}
+
+// 64 times the 16384 bytes UEFI requires be reserved for the entry array.
+#define GPT_MAX_ARRAY_SIZE (1024 * 1024)
+
+// UEFI 2.11 section 5.3.2 requires four checks before a GPT may be used: the
+// signature, the header CRC, that MyLBA names the block the header was read
+// from, and the entry array CRC.
+static bool gpt_verify_header(struct volume *volume,
+                              struct gpt_table_header *header,
+                              uint64_t header_lba, int lb_size,
+                              uint64_t *budget) {
+    if (strncmp(header->signature, "EFI PART", 8)) {
+        return false;
+    }
+
+    if (header->revision != 0x00010000) {
+        return false;
+    }
+
+    // HeaderSize bounds the CRC's extent, and is itself bounded by the defined
+    // fields below and the header's own block above.
+    if (header->header_size < sizeof(struct gpt_table_header)
+     || (uint64_t)header->header_size > (uint64_t)lb_size) {
+        return false;
+    }
+
+    if (header->my_lba != header_lba) {
+        return false;
+    }
+
+    uint64_t header_loc = CHECKED_MUL(header_lba, (uint64_t)lb_size, return false);
+
+    struct gpt_table_header zeroed = *header;
+    zeroed.crc32 = 0;
+
+    uint32_t crc = crc32_update(0xffffffff, &zeroed, sizeof(zeroed));
+    if (header->header_size > sizeof(zeroed)) {
+        uint64_t tail = CHECKED_ADD(header_loc, sizeof(zeroed), return false);
+        if (!crc32_volume_range(volume, tail,
+                                header->header_size - sizeof(zeroed), &crc)) {
+            return false;
+        }
+    }
+
+    if (~crc != header->crc32) {
+        return false;
+    }
+
+    // "shall be set to a value of 128 x 2^n", which is to say a power of two no
+    // smaller than an entry. Revisions before 2.8 allowed any multiple of 8.
+    uint32_t entry_size = header->size_of_partition_entry;
+    if (entry_size < sizeof(struct gpt_entry)
+     || (entry_size & (entry_size - 1)) != 0) {
+        return false;
+    }
+
+    uint64_t array_size = CHECKED_MUL((uint64_t)header->number_of_partition_entries,
+                                      (uint64_t)entry_size, return false);
+    if (array_size == 0) {
+        return false;
+    }
+
+    // A resource limit, not a conformance one: the specification states no
+    // maximum, and the geometry below cannot supply one because it bounds the
+    // array by FirstUsableLBA, which the same table writes.
+    if (array_size > GPT_MAX_ARRAY_SIZE || array_size > *budget) {
+        return false;
+    }
+
+    // The array is reserved outside the usable range: it precedes FirstUsableLBA
+    // on the primary, and follows LastUsableLBA and precedes its own header on
+    // the alternate.
+    uint64_t array_lba = header->partition_entry_lba;
+    uint64_t array_blocks = (array_size + (uint64_t)lb_size - 1) / (uint64_t)lb_size;
+    uint64_t array_end = CHECKED_ADD(array_lba, array_blocks, return false);
+
+    if (header->first_usable_lba > header->last_usable_lba) {
+        return false;
+    }
+
+    if (array_lba < header->first_usable_lba) {
+        if (array_end > header->first_usable_lba) {
+            return false;
+        }
+    } else if (array_lba <= header->last_usable_lba || array_end > header_lba) {
+        return false;
+    }
+
+    if (volume->sect_count != (uint64_t)-1) {
+        // Only the array has to be readable: LastUsableLBA is the table's claim
+        // about the medium, and partition_range_valid() bounds each entry.
+        uint64_t device_blocks = volume->sect_count / (uint64_t)(lb_size / 512);
+        if (array_end > device_blocks) {
+            return false;
+        }
+    }
+
+    uint64_t array_loc = CHECKED_MUL(array_lba, (uint64_t)lb_size, return false);
+
+    *budget -= array_size;
+
+    crc = 0xffffffff;
+    if (!crc32_volume_range(volume, array_loc, array_size, &crc)) {
+        return false;
+    }
+
+    return ~crc == header->partition_entry_array_crc32;
+}
+
+// Enumeration asks for one partition index at a time, so without this the entry
+// array is verified once per index, and its size is set by the table being
+// verified. Re-reading the header and comparing it is cheap where recomputing
+// the array CRC is not.
+static struct volume *gpt_memo_volume = NULL;
+static struct gpt_table_header gpt_memo_header;
+static uint64_t gpt_memo_lba;
+static int gpt_memo_lb_size;
+
+// A volume with no valid GPT is asked again for every partition index, and
+// answering costs the whole search: three block sizes, up to three blocks
+// tried at each. Confirmed by re-reading rather than on the pointer alone, so
+// a recycled volume cannot inherit the answer.
+static struct volume *gpt_memo_none_volume = NULL;
+static struct gpt_table_header gpt_memo_none_block;
+static bool gpt_memo_none_readable;
+
+static bool gpt_memo_none_hit(struct volume *volume) {
+    struct gpt_table_header fresh;
+
+    if (gpt_memo_none_volume != volume) {
+        return false;
+    }
+
+    if (!volume_read(volume, &fresh, 512, sizeof(fresh))) {
+        return !gpt_memo_none_readable;
+    }
+
+    return gpt_memo_none_readable
+        && memcmp(&fresh, &gpt_memo_none_block, sizeof(fresh)) == 0;
+}
+
+static void gpt_memo_none_store(struct volume *volume) {
+    gpt_memo_none_volume = volume;
+    gpt_memo_none_readable = volume_read(volume, &gpt_memo_none_block, 512,
+                                         sizeof(gpt_memo_none_block));
+}
+
+static bool gpt_memo_hit(struct volume *volume,
+                         struct gpt_table_header *header, int *lb_size) {
+    struct gpt_table_header fresh;
+
+    if (gpt_memo_volume != volume) {
+        return false;
+    }
+
+    uint64_t loc = CHECKED_MUL(gpt_memo_lba, (uint64_t)gpt_memo_lb_size,
+                               return false);
+
+    if (!volume_read(volume, &fresh, loc, sizeof(fresh))
+     || memcmp(&fresh, &gpt_memo_header, sizeof(fresh)) != 0) {
+        return false;
+    }
+
+    *header = gpt_memo_header;
+    *lb_size = gpt_memo_lb_size;
+    return true;
+}
+
+static void gpt_memo_store(struct volume *volume,
+                           const struct gpt_table_header *header,
+                           uint64_t header_lba, int lb_size) {
+    gpt_memo_volume = volume;
+    gpt_memo_header = *header;
+    gpt_memo_lba = header_lba;
+    gpt_memo_lb_size = lb_size;
+}
+
+// A hybrid MBR carries its 0xEE entry beside the real ones, so it counts too.
+static bool gpt_protective_mbr(struct volume *volume) {
+    for (int i = 0; i < 4; i++) {
+        uint8_t type;
+
+        if (!volume_read(volume, &type, 0x1be + 16 * i + 4, sizeof(type))) {
+            return false;
+        }
+
+        if (type == 0xee) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// UEFI 2.11 section 5.3.2 requires falling back to the alternate header when the
+// primary does not verify, and places it in the last block. A disk imaged onto a
+// larger one keeps its alternate where the smaller one ended, so the block the
+// primary names is tried after the last block rather than instead of it: a
+// genuine alternate at the end wins over whatever a corrupt primary points at.
+static bool gpt_locate_header(struct volume *volume,
+                              struct gpt_table_header *header, int *lb_size) {
+    // The size a table was written for belongs to the image, not to the medium
+    // it ends up on: a 512-byte-LBA GPT reads correctly from 2048-byte optical
+    // media, which is what an ISOHYBRID is. So this is probed rather than taken
+    // from the volume's sector size. 2048 is optical.
     int lb_guesses[] = {
         512,
+        2048,
         4096
     };
-    int lb_size = -1;
+
+    // A header that fails its array CRC has already paid for it, so the budget
+    // covers the two locations the recovery rule names rather than one call.
+    uint64_t budget = GPT_MAX_ARRAY_SIZE * 2;
+
+    if (gpt_memo_hit(volume, header, lb_size)) {
+        return true;
+    }
+
+    if (gpt_memo_none_hit(volume)) {
+        return false;
+    }
+
+    // A disk reformatted to MBR keeps the GPT the new table did not reach, and
+    // LBA 0 is what says whether that GPT is still live.
+    if (!gpt_protective_mbr(volume)) {
+        return false;
+    }
 
     for (size_t i = 0; i < SIZEOF_ARRAY(lb_guesses); i++) {
-        // read header, located after the first block
-        if (!volume_read(volume, &header, lb_guesses[i] * 1, sizeof(header)))
-            continue;
+        int guess = lb_guesses[i];
+        uint64_t candidates[2];
+        size_t candidate_count = 0;
 
-        // check the header
-        // 'EFI PART'
-        if (strncmp(header.signature, "EFI PART", 8))
-            continue;
+        if (volume_read(volume, header, (uint64_t)guess * 1, sizeof(*header))) {
+            if (gpt_verify_header(volume, header, 1, guess, &budget)) {
+                *lb_size = guess;
+                gpt_memo_store(volume, header, 1, guess);
+                return true;
+            }
 
-        lb_size = lb_guesses[i];
-        break;
+            // The signature is what identifies the block as a header at all,
+            // so only a header that failed its CRC is followed. Without it the
+            // field is not an LBA, it is whatever happens to be at offset 32.
+            if (!strncmp(header->signature, "EFI PART", 8)
+             && header->alternate_lba > 1) {
+                candidates[candidate_count++] = header->alternate_lba;
+            }
+        }
+
+        if (volume->sect_count != (uint64_t)-1 && guess >= 512) {
+            uint64_t blocks = volume->sect_count / (uint64_t)(guess / 512);
+            if (blocks >= 2) {
+                // Ahead of whatever the primary claimed.
+                if (candidate_count > 0 && candidates[0] == blocks - 1) {
+                    candidate_count = 0;
+                }
+                candidates[candidate_count++] = blocks - 1;
+                if (candidate_count == 2) {
+                    uint64_t claimed = candidates[0];
+                    candidates[0] = candidates[1];
+                    candidates[1] = claimed;
+                }
+            }
+        }
+
+        for (size_t j = 0; j < candidate_count; j++) {
+            uint64_t loc = CHECKED_MUL(candidates[j], (uint64_t)guess, continue);
+
+            if (volume_read(volume, header, loc, sizeof(*header))
+             && gpt_verify_header(volume, header, candidates[j], guess, &budget)) {
+                *lb_size = guess;
+                gpt_memo_store(volume, header, candidates[j], guess);
+                return true;
+            }
+        }
     }
 
-    if (lb_size == -1) {
+    gpt_memo_none_store(volume);
+
+    return false;
+}
+
+bool gpt_get_guid(struct guid *guid, struct volume *volume) {
+    struct gpt_table_header header = {0};
+    int lb_size;
+
+    if (!gpt_locate_header(volume, &header, &lb_size)) {
         return false;
     }
-
-    if (header.revision != 0x00010000)
-        return false;
 
     *guid = header.disk_guid;
 
     return true;
 }
 
+// Maximum number of GPT partitions to bound enumeration driven by the volume's
+// own entry count. Clamped rather than rejected to keep oversized tables usable.
+#define MAX_GPT_PARTITIONS 256
+
 static int gpt_get_part(struct volume *ret, struct volume *volume, int partition) {
     struct gpt_table_header header = {0};
+    int lb_size;
 
-    int lb_guesses[] = {
-        512,
-        4096
-    };
-    int lb_size = -1;
-
-    for (size_t i = 0; i < SIZEOF_ARRAY(lb_guesses); i++) {
-        // read header, located after the first block
-        if (!volume_read(volume, &header, lb_guesses[i] * 1, sizeof(header)))
-            continue;
-
-        // check the header
-        // 'EFI PART'
-        if (strncmp(header.signature, "EFI PART", 8))
-            continue;
-
-        lb_size = lb_guesses[i];
-        break;
-    }
-
-    if (lb_size == -1) {
+    if (!gpt_locate_header(volume, &header, &lb_size)) {
         return INVALID_TABLE;
     }
-
-    if (header.revision != 0x00010000)
-        return INVALID_TABLE;
 
     // parse the entries if reached here
-    if ((uint32_t)partition >= header.number_of_partition_entries)
+    uint32_t entry_count = header.number_of_partition_entries;
+    if (entry_count > MAX_GPT_PARTITIONS) {
+        entry_count = MAX_GPT_PARTITIONS;
+    }
+
+    if ((uint32_t)partition >= entry_count)
         return END_OF_TABLE;
 
     // Validate partition entry size (must be at least as large as our struct)
@@ -242,8 +526,9 @@ static int gpt_get_part(struct volume *ret, struct volume *volume, int partition
     }
 
     struct guid empty_guid = {0};
-    if (!memcmp(&entry.unique_partition_guid, &empty_guid, sizeof(struct guid)))
+    if (!memcmp(&entry.partition_type_guid, &empty_guid, sizeof(struct guid))) {
         return NO_PARTITION;
+    }
 
     // Validate that ending_lba >= starting_lba to prevent underflow
     if (entry.ending_lba < entry.starting_lba) {
@@ -317,9 +602,43 @@ struct mbr_entry {
     uint32_t sect_count;
 } __attribute__((packed));
 
+// An entry whose LBAs have been brought into the 512-byte units struct volume
+// keeps.
+struct mbr_part {
+    uint8_t type;
+    uint64_t first_sect;
+    uint64_t sect_count;
+};
+
+// MBR LBAs count the device's logical blocks: UEFI 2.11 Table 5.2 sizes a
+// partition "in LBA units of logical blocks", and Linux scales them by the
+// device's block size in turn. Optical media are the exception, an isohybrid
+// MBR being written in 512-byte units whatever the drive reports.
+static bool mbr_read_entry(struct volume *volume, uint64_t offset,
+                           struct mbr_part *part) {
+    struct mbr_entry entry;
+
+    if (!volume_read(volume, &entry, offset, sizeof(struct mbr_entry))) {
+        return false;
+    }
+
+    uint64_t mult = volume->is_optical ? 1 : (uint64_t)volume->sector_size / 512;
+
+    part->type = entry.type;
+    part->first_sect = (uint64_t)entry.first_sect * mult;
+    part->sect_count = (uint64_t)entry.sect_count * mult;
+
+    return true;
+}
+
 bool is_valid_mbr(struct volume *volume) {
     // Check if actually valid mbr
     uint16_t hint = 0;
+
+    if (!volume_read(volume, &hint, 510, sizeof(uint16_t)))
+        return false;
+    if (hint != 0xaa55)
+        return false;
 
     if (!volume_read(volume, &hint, 446, sizeof(uint8_t)))
         return false;
@@ -379,9 +698,23 @@ uint32_t mbr_get_id(struct volume *volume) {
 // Maximum number of logical partitions to prevent infinite loops from circular EBR chains
 #define MAX_LOGICAL_PARTITIONS 256
 
+// A data entry's start is relative to the EBR that carries it, where the chain
+// link's is relative to the extended partition.
+static bool mbr_logical_entry_contained(struct volume *extended_part, uint64_t ebr_sector,
+                                        struct mbr_part *entry, uint64_t *first_sect) {
+    uint64_t rel_first = CHECKED_ADD(ebr_sector, entry->first_sect, return false);
+    if (!partition_range_valid(extended_part, rel_first, entry->sect_count)) {
+        return false;
+    }
+
+    *first_sect = CHECKED_ADD(extended_part->first_sect, rel_first, return false);
+
+    return partition_range_valid(extended_part->backing_dev, *first_sect, entry->sect_count);
+}
+
 static int mbr_get_logical_part(struct volume *ret, struct volume *extended_part,
                                 int partition) {
-    struct mbr_entry entry;
+    struct mbr_part entry;
 
     // Limit partition index to prevent excessive iteration
     if (partition >= MAX_LOGICAL_PARTITIONS) {
@@ -389,25 +722,108 @@ static int mbr_get_logical_part(struct volume *ret, struct volume *extended_part
     }
 
     uint64_t ebr_sector = 0;
-    uint64_t prev_ebr_sector = 0;
+    uint64_t ebr_size = extended_part->sect_count;
+    uint64_t first_sect_64 = 0;
+    int accepted = 0;
+    bool found = false;
 
-    for (int i = 0; i < partition; i++) {
-        uint64_t entry_offset = ebr_sector * 512 + 0x1ce;
+    // Partitions are probed in order, so carry on from where the last probe
+    // stopped instead of following the chain from its head every time.
+    if (extended_part->ebr_walk_index <= partition) {
+        accepted = extended_part->ebr_walk_index;
+        ebr_sector = extended_part->ebr_walk_sector;
+        ebr_size = extended_part->ebr_walk_size;
+    }
 
-        if (!volume_read(extended_part, &entry, entry_offset, sizeof(struct mbr_entry))) {
+    for (int link = 0; link < MAX_LOGICAL_PARTITIONS; link++) {
+        // The memo pairs an EBR with the count of logicals before it, so it has
+        // to be taken before this EBR's own entries are counted.
+        extended_part->ebr_walk_index = accepted;
+        extended_part->ebr_walk_sector = ebr_sector;
+        extended_part->ebr_walk_size = ebr_size;
+
+        // Each EBR is an MBR-format sector of its own that is_valid_mbr() never
+        // saw, and util-linux ends the chain at one lacking the signature.
+        uint16_t signature;
+
+        if (!volume_read(extended_part, &signature, ebr_sector * 512 + 510, sizeof(uint16_t))) {
             return END_OF_TABLE;
         }
 
-        if (entry.type != 0x0f && entry.type != 0x05) {
+        if (signature != 0xaa55) {
             return END_OF_TABLE;
         }
 
-        prev_ebr_sector = ebr_sector;
-        ebr_sector = entry.first_sect;
+        uint64_t link_first_sect = 0;
+        uint64_t link_sect_count = 0;
+        bool have_link = false;
+
+        // The first two entries are a convention rather than a rule: util-linux
+        // takes data from any slot and the link from the first extended entry.
+        for (int i = 0; i < 4; i++) {
+            uint64_t entry_offset = ebr_sector * 512 + 0x1be + sizeof(struct mbr_entry) * i;
+
+            if (!mbr_read_entry(extended_part, entry_offset, &entry)) {
+                return END_OF_TABLE;
+            }
+
+            if (entry.type == 0x0f || entry.type == 0x05 || entry.type == 0x85) {
+                // An empty slot carrying an extended type is not the link, and
+                // latching it would hide a real one in a later slot.
+                if (!have_link && entry.sect_count != 0) {
+                    have_link = true;
+                    link_first_sect = entry.first_sect;
+                    link_sect_count = entry.sect_count;
+                }
+                continue;
+            }
+
+            // The running system counts on size alone, so a type byte tested
+            // here would shift every number after it.
+            if (entry.sect_count == 0) {
+                continue;
+            }
+
+            bool contained = mbr_logical_entry_contained(extended_part, ebr_sector,
+                                                         &entry, &first_sect_64);
+
+            // Containment in the extended partition does not imply containment
+            // in the extent the link that led to this EBR declared.
+            bool within_link = entry.first_sect + entry.sect_count <= ebr_size;
+
+            // A number here has to match the one the running system gives the
+            // same partition, and the first two slots are counted whether or
+            // not they lie inside the extended partition.
+            if (i >= 2 && (!contained || !within_link)) {
+                continue;
+            }
+
+            if (accepted == partition) {
+                if (!contained) {
+                    return NO_PARTITION;
+                }
+                found = true;
+                break;
+            }
+
+            accepted++;
+        }
+
+        if (found) {
+            break;
+        }
+
+        if (!have_link) {
+            return END_OF_TABLE;
+        }
+
+        uint64_t prev_ebr_sector = ebr_sector;
+        ebr_sector = link_first_sect;
+        ebr_size = link_sect_count;
 
         // Detect circular chain: if new sector points to 0 or backwards, it's invalid
         // (EBR sectors should always increase within the extended partition)
-        if (ebr_sector == 0 || (i > 0 && ebr_sector <= prev_ebr_sector)) {
+        if (ebr_sector == 0 || ebr_sector <= prev_ebr_sector) {
             return END_OF_TABLE;  // Circular or corrupted EBR chain
         }
 
@@ -417,28 +833,8 @@ static int mbr_get_logical_part(struct volume *ret, struct volume *extended_part
         }
     }
 
-    uint64_t entry_offset = ebr_sector * 512 + 0x1be;
-
-    if (!volume_read(extended_part, &entry, entry_offset, sizeof(struct mbr_entry))) {
+    if (!found) {
         return END_OF_TABLE;
-    }
-
-    if (entry.type == 0)
-        return NO_PARTITION;
-
-    // Validate sect_count is non-zero
-    if (entry.sect_count == 0) {
-        return NO_PARTITION;
-    }
-
-    uint64_t logical_rel_first = CHECKED_ADD(ebr_sector, entry.first_sect, return NO_PARTITION);
-    if (!partition_range_valid(extended_part, logical_rel_first, entry.sect_count)) {
-        return NO_PARTITION;
-    }
-
-    uint64_t first_sect_64 = CHECKED_ADD(extended_part->first_sect, logical_rel_first, return NO_PARTITION);
-    if (!partition_range_valid(extended_part->backing_dev, first_sect_64, entry.sect_count)) {
-        return NO_PARTITION;
     }
 
 #if defined (UEFI)
@@ -483,18 +879,23 @@ static int mbr_get_part(struct volume *ret, struct volume *volume, int partition
         return INVALID_TABLE;
     }
 
-    struct mbr_entry entry;
+    struct mbr_part entry;
 
     if (partition > 3) {
+        if (volume->ebr_part != NULL) {
+            return mbr_get_logical_part(ret, volume->ebr_part, partition - 4);
+        }
+
         for (int i = 0; i < 4; i++) {
             uint64_t entry_offset = 0x1be + sizeof(struct mbr_entry) * i;
 
-            if (!volume_read(volume, &entry, entry_offset, sizeof(struct mbr_entry))) {
+            if (!mbr_read_entry(volume, entry_offset, &entry)) {
                 continue;
             }
 
-            if (entry.type != 0x0f && entry.type != 0x05)
+            if (entry.type != 0x0f && entry.type != 0x05 && entry.type != 0x85) {
                 continue;
+            }
 
             // Validate extended partition has non-zero size
             if (entry.sect_count == 0) {
@@ -505,24 +906,29 @@ static int mbr_get_part(struct volume *ret, struct volume *volume, int partition
                 continue;
             }
 
-            struct volume extended_part = {0};
+            struct volume *extended_part = ext_mem_alloc(sizeof(struct volume));
 
 #if defined (UEFI)
-            extended_part.efi_handle  = volume->efi_handle;
-            extended_part.block_io    = volume->block_io;
+            extended_part->efi_handle  = volume->efi_handle;
+            extended_part->block_io    = volume->block_io;
 #elif defined (BIOS)
-            extended_part.drive       = volume->drive;
+            extended_part->drive       = volume->drive;
 #endif
-            extended_part.fastest_xfer_size = volume->fastest_xfer_size;
-            extended_part.index       = volume->index;
-            extended_part.is_optical  = volume->is_optical;
-            extended_part.partition   = i + 1;
-            extended_part.sector_size = volume->sector_size;
-            extended_part.first_sect  = entry.first_sect;
-            extended_part.sect_count  = entry.sect_count;
-            extended_part.backing_dev = volume;
+            extended_part->fastest_xfer_size = volume->fastest_xfer_size;
+            extended_part->index       = volume->index;
+            extended_part->is_optical  = volume->is_optical;
+            extended_part->partition   = i + 1;
+            extended_part->sector_size = volume->sector_size;
+            extended_part->first_sect  = entry.first_sect;
+            extended_part->sect_count  = entry.sect_count;
+            extended_part->backing_dev = volume;
 
-            return mbr_get_logical_part(ret, &extended_part, partition - 4);
+            // The head EBR may describe the whole extended partition.
+            extended_part->ebr_walk_size = entry.sect_count;
+
+            volume->ebr_part = extended_part;
+
+            return mbr_get_logical_part(ret, extended_part, partition - 4);
         }
 
         return END_OF_TABLE;
@@ -530,7 +936,7 @@ static int mbr_get_part(struct volume *ret, struct volume *volume, int partition
 
     uint64_t entry_offset = 0x1be + sizeof(struct mbr_entry) * partition;
 
-    if (!volume_read(volume, &entry, entry_offset, sizeof(struct mbr_entry))) {
+    if (!mbr_read_entry(volume, entry_offset, &entry)) {
         return END_OF_TABLE;
     }
 
@@ -622,8 +1028,11 @@ struct volume *volume_get_by_guid(struct guid *guid) {
 
 struct volume *volume_get_by_fslabel(char *fslabel) {
     for (size_t i = 0; i < volume_index_i; i++) {
+        // Both filesystems Limine reads a label from are case insensitive, and
+        // both store labels upper-cased, so a literal compare would reject the
+        // spelling a user reads off their own system.
         if (volume_index[i]->fslabel_valid
-         && strcmp(volume_index[i]->fslabel, fslabel) == 0) {
+         && strcasecmp(volume_index[i]->fslabel, fslabel) == 0) {
             return volume_index[i];
         }
     }

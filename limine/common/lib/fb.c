@@ -33,6 +33,7 @@ void fb_init(struct fb_info **ret, size_t *_fbs_count,
     } else {
         *_fbs_count = 0;
         pmm_free(*ret, sizeof(struct fb_info));
+        *ret = NULL;
     }
 #elif defined (UEFI)
     init_gop(ret, _fbs_count, target_width, target_height, target_bpp);
@@ -123,64 +124,236 @@ void fb_clear(struct fb_info *fb) {
 }
 
 #if defined (__aarch64__)
-static void fb_flush_aarch64(volatile void *base, size_t length) {
-    clean_dcache_poc((uintptr_t)base, CHECKED_ADD((uintptr_t)base, length, return));
+static bool fb_flush_aarch64(volatile void *base, size_t length) {
+    clean_dcache_poc((uintptr_t)base, CHECKED_ADD((uintptr_t)base, length, return false));
+    return true;
 }
 #elif defined (__riscv)
 __attribute__((target("arch=+zicbom")))
-static void fb_flush_riscv(volatile void *base, size_t length) {
-    const size_t cbom_block_size = 0x40;
+static bool fb_flush_riscv(volatile void *base, size_t length) {
+    const size_t cbom_block_size = riscv_cbom_block_size();
     uintptr_t start = ALIGN_DOWN((uintptr_t)base, cbom_block_size);
-    uintptr_t end = ALIGN_UP(CHECKED_ADD((uintptr_t)base, length, return), cbom_block_size, return);
+    uintptr_t end = ALIGN_UP(CHECKED_ADD((uintptr_t)base, length, return false), cbom_block_size, return false);
     for (uintptr_t ptr = start; ptr < end; ptr += cbom_block_size) {
         asm volatile("cbo.flush (%0)" :: "r"(ptr) : "memory");
     }
     asm volatile ("fence rw, rw" ::: "memory");
+    return true;
 }
 
-static void fb_flush_riscv_nozicbom(volatile void *base, size_t length) {
-    (void)base;
-    (void)length;
-
-    // Without Zicbom, there is no portable instruction to flush dirty cache lines.
-    // Read through a dedicated eviction buffer to create cache pressure and displace
-    // dirty framebuffer lines. 128 KB covers typical RISC-V L1 D-caches (32-64 KB).
-    static volatile uint8_t *eviction_buf = NULL;
-    #define EVICTION_BUF_SIZE (128 * 1024)
-    if (eviction_buf == NULL) {
-        eviction_buf = ext_mem_alloc(EVICTION_BUF_SIZE);
-    }
-
-    volatile uint64_t *p = (volatile uint64_t *)eviction_buf;
-    for (size_t i = 0; i < EVICTION_BUF_SIZE / sizeof(uint64_t); i += (64 / sizeof(uint64_t))) {
-        (void)p[i];
-    }
-    asm volatile ("fence rw, rw" ::: "memory");
-}
 #elif defined (__loongarch64)
-static void fb_flush_loongarch64(volatile void *base, size_t length) {
-    // cacop Hit_Writeback_Inv_LEAF0 = 0x10 (D-cache L1 writeback+invalidate)
-    const size_t clsz = 64;
-    uintptr_t start = ALIGN_DOWN((uintptr_t)base, clsz);
-    uintptr_t end = ALIGN_UP(CHECKED_ADD((uintptr_t)base, length, return), clsz, return);
-    for (uintptr_t ptr = start; ptr < end; ptr += clsz) {
-        asm volatile ("cacop 0x10, %0, 0" :: "r"(ptr) : "memory");
+// cacop's code[2:0] names a cache in the order CPUCFG 0x10 lists them, one leaf
+// per present bit (manual section 4.2.3.1), so the numbering is a property of
+// the part rather than of the architecture.
+#define LOONGARCH_CACHE_CFG 0x10
+#define LOONGARCH_L1_IU_PRESENT ((uint32_t)1 << 0)
+#define LOONGARCH_L1_IU_UNIFY ((uint32_t)1 << 1)
+#define LOONGARCH_L1_D_PRESENT ((uint32_t)1 << 2)
+// Levels two and up repeat one layout every seven bits from bit 3, for L2 and
+// L3 alone: the word defines nothing above bit 16.
+#define LOONGARCH_LX_FIRST_BIT 3
+#define LOONGARCH_LX_BITS 7
+#define LOONGARCH_LX_LEVELS 2
+#define LOONGARCH_LX_IU_PRESENT ((uint32_t)1 << 0)
+#define LOONGARCH_LX_IU_UNIFY ((uint32_t)1 << 1)
+#define LOONGARCH_LX_D_PRESENT ((uint32_t)1 << 4)
+#define LOONGARCH_MAX_LEAVES 6
+// Only four caches carry a size word: 0x11 is the one 0x10's L1 IU Present
+// names, 0x12 its L1 D, 0x13 its L2 IU and 0x14 its L3 IU. Each holds
+// log2(line bytes) in bits 30:24.
+#define LOONGARCH_L2_IU_PRESENT ((uint32_t)1 << LOONGARCH_LX_FIRST_BIT)
+#define LOONGARCH_L3_IU_PRESENT ((uint32_t)1 << (LOONGARCH_LX_FIRST_BIT + LOONGARCH_LX_BITS))
+#define LOONGARCH_LINESIZE_SHIFT 24
+#define LOONGARCH_LINESIZE_MASK 0x7f
+
+// Where a writeback lands is decided by the inclusion relations between levels,
+// so maintaining one leaf does not reach memory by itself. An instruction cache
+// holds no data and is never written back. The manual does not say an inclusive
+// level writes its inner copies back rather than merely invalidating them, so
+// every data leaf is maintained.
+static uint32_t loongarch_writeback_leaves(void) {
+    uint32_t cfg = loongarch_cpucfg(LOONGARCH_CACHE_CFG);
+    uint32_t mask = 0;
+    unsigned leaf = 0;
+
+    if (cfg & LOONGARCH_L1_IU_PRESENT) {
+        if (cfg & LOONGARCH_L1_IU_UNIFY) {
+            mask |= (uint32_t)1 << leaf;
+        }
+        leaf++;
     }
+
+    if (cfg & LOONGARCH_L1_D_PRESENT) {
+        mask |= (uint32_t)1 << leaf;
+        leaf++;
+    }
+
+    for (unsigned level = 0; level < LOONGARCH_LX_LEVELS; level++) {
+        uint32_t lx = cfg >> (LOONGARCH_LX_FIRST_BIT + level * LOONGARCH_LX_BITS);
+
+        if (lx & LOONGARCH_LX_IU_PRESENT) {
+            if (lx & LOONGARCH_LX_IU_UNIFY) {
+                mask |= (uint32_t)1 << leaf;
+            }
+            leaf++;
+        }
+
+        if (lx & LOONGARCH_LX_D_PRESENT) {
+            mask |= (uint32_t)1 << leaf;
+            leaf++;
+        }
+    }
+
+    return mask;
+}
+
+// cacop takes the cache as an immediate, so each leaf needs its own loop.
+#define LOONGARCH_WRITEBACK(code) \
+    for (uintptr_t ptr = start; ptr < end; ptr += clsz) { \
+        asm volatile ("cacop " code ", %0, 0" :: "r"(ptr) : "memory"); \
+    }
+
+static uint32_t loongarch_leaves(void) {
+    static uint32_t leaves = 0;
+    static bool probed = false;
+
+    if (!probed) {
+        leaves = loongarch_writeback_leaves();
+        probed = true;
+    }
+
+    return leaves;
+}
+
+// A maintained L2 or L3 *data* cache has no size word at all, so its line cannot
+// be read. Striding by the smallest line any present cache reports covers every
+// line of all of them; a larger stride would leave every other line dirty.
+static size_t loongarch_line_size(void) {
+    static size_t clsz = 0;
+
+    if (clsz != 0) {
+        return clsz;
+    }
+
+    static const uint32_t present[4] = {
+        LOONGARCH_L1_IU_PRESENT, LOONGARCH_L1_D_PRESENT,
+        LOONGARCH_L2_IU_PRESENT, LOONGARCH_L3_IU_PRESENT
+    };
+    uint32_t cfg = loongarch_cpucfg(LOONGARCH_CACHE_CFG);
+
+    for (unsigned i = 0; i < 4; i++) {
+        if (!(cfg & present[i])) {
+            continue;
+        }
+
+        uint32_t word = loongarch_cpucfg(0x11 + i);
+        unsigned log2 = (word >> LOONGARCH_LINESIZE_SHIFT) & LOONGARCH_LINESIZE_MASK;
+
+        // A line narrower than a pointer, or wider than any plausible cache, is
+        // a field this part does not populate rather than a size.
+        if (log2 < 3 || log2 > 12) {
+            continue;
+        }
+
+        size_t line = (size_t)1 << log2;
+        if (clsz == 0 || line < clsz) {
+            clsz = line;
+        }
+    }
+
+    if (clsz == 0) {
+        clsz = 64;
+    }
+
+    return clsz;
+}
+
+static bool fb_flush_loongarch64(volatile void *base, size_t length) {
+    uint32_t leaves = loongarch_leaves();
+
+    // No data cache and a CPUCFG word the part does not implement both read as
+    // zero here, so a flush cannot be promised even where none was needed.
+    if (leaves == 0) {
+        return false;
+    }
+
+    const size_t clsz = loongarch_line_size();
+    uintptr_t start = ALIGN_DOWN((uintptr_t)base, clsz);
+    uintptr_t end = ALIGN_UP(CHECKED_ADD((uintptr_t)base, length, return false), clsz, return false);
+
+    // Hit-mode cacop probes the cache like a load and acts only on a hit, and the
+    // manual gives no ordering between it and prior stores, so drain them first.
+    asm volatile ("dbar 0" ::: "memory");
+
+    for (unsigned leaf = 0; leaf < LOONGARCH_MAX_LEAVES; leaf++) {
+        if (!(leaves & ((uint32_t)1 << leaf))) {
+            continue;
+        }
+
+        switch (leaf) {
+            case 0: {
+                LOONGARCH_WRITEBACK("0x10");
+                break;
+            }
+            case 1: {
+                LOONGARCH_WRITEBACK("0x11");
+                break;
+            }
+            case 2: {
+                LOONGARCH_WRITEBACK("0x12");
+                break;
+            }
+            case 3: {
+                LOONGARCH_WRITEBACK("0x13");
+                break;
+            }
+            case 4: {
+                LOONGARCH_WRITEBACK("0x14");
+                break;
+            }
+            case 5: {
+                LOONGARCH_WRITEBACK("0x15");
+                break;
+            }
+            default: {
+                break;
+            }
+        }
+    }
+
+    asm volatile ("dbar 0" ::: "memory");
+    return true;
 }
 #endif
 
-void fb_flush(volatile void *base, size_t length) {
-    typedef void (*flush_fn)(volatile void *, size_t);
-    static flush_fn fn = NULL;
+bool fb_flush_reliable(void) {
+    static bool probed = false;
+    static bool reliable = true;
 
-    if (fn == NULL) {
+    if (!probed) {
+#if defined (__riscv)
+        reliable = riscv_check_isa_extension("zicbom", NULL, NULL);
+#elif defined (__loongarch64)
+        reliable = loongarch_leaves() != 0;
+#endif
+        probed = true;
+    }
+
+    return reliable;
+}
+
+bool fb_flush(volatile void *base, size_t length) {
+    typedef bool (*flush_fn)(volatile void *, size_t);
+    static flush_fn fn = NULL;
+    static bool probed = false;
+
+    if (!probed) {
+        probed = true;
 #if defined (__aarch64__)
         fn = fb_flush_aarch64;
 #elif defined (__riscv)
         if (riscv_check_isa_extension("zicbom", NULL, NULL)) {
             fn = fb_flush_riscv;
-        } else {
-            fn = fb_flush_riscv_nozicbom;
         }
 #elif defined (__loongarch64)
         fn = fb_flush_loongarch64;
@@ -188,6 +361,13 @@ void fb_flush(volatile void *base, size_t length) {
     }
 
     if (fn != NULL) {
-        fn(base, length);
+        return fn(base, length);
     }
+
+    // Coherent by construction, or with no way to get there.
+    return fb_flush_reliable();
+}
+
+void fb_flush_cb(volatile void *base, size_t length) {
+    (void)fb_flush(base, length);
 }

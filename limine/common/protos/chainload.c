@@ -6,6 +6,7 @@
 #include <lib/guid.h>
 #include <lib/config.h>
 #include <lib/misc.h>
+#include <lib/acpi.h>
 #include <drivers/disk.h>
 #include <lib/term.h>
 #include <lib/fb.h>
@@ -86,10 +87,11 @@ noreturn static void spinup(uint8_t drive, void *buf) {
 noreturn void spinup_freebsd(uint32_t drive, uint32_t buf, uint32_t count);
 
 // FreeBSD's freebsd-boot partition contains gptboot, a multi-sector binary with
-// no MBR signature that FreeBSD's pmbr loads whole to 0x7C00. Cap prevents
-// EBDA overwrite.
+// no MBR signature that FreeBSD's pmbr loads whole to 0x7C00. pmbr stops the
+// load at 0x90000 and truncates rather than failing.
 #define FREEBSD_BOOT_TYPE_GUID "83bd6b9d-7f41-11dc-be0b-001560b84f0f"
-#define FREEBSD_BOOT_LOAD_MAX 0x80000
+#define FREEBSD_BOOT_LOAD_ADDR 0x7c00
+#define FREEBSD_BOOT_LOAD_TOP 0x90000
 
 noreturn void chainload(char *config, char *cmdline) {
     (void)cmdline;
@@ -204,9 +206,12 @@ load:
     if (p->part_type_guid_valid
      && string_to_guid_mixed(&freebsd_boot_guid, FREEBSD_BOOT_TYPE_GUID)
      && memcmp(&p->part_type_guid, &freebsd_boot_guid, sizeof(struct guid)) == 0) {
-        uint64_t load_size = (uint64_t)p->sect_count * (uint64_t)p->sector_size;
-        if (load_size > FREEBSD_BOOT_LOAD_MAX) {
-            load_size = FREEBSD_BOOT_LOAD_MAX;
+        // sect_count is always in 512-byte sectors, regardless of sector_size.
+        uint64_t load_size = (uint64_t)p->sect_count * 512;
+        // pmbr's ceiling is fixed, so it clobbers an EBDA sitting below it.
+        uint64_t load_top = MIN((uint64_t)FREEBSD_BOOT_LOAD_TOP, (uint64_t)EBDA);
+        if (load_size > load_top - FREEBSD_BOOT_LOAD_ADDR) {
+            load_size = load_top - FREEBSD_BOOT_LOAD_ADDR;
         }
         if (load_size == 0) {
             panic(true, "bios: freebsd-boot partition has zero size");
@@ -342,7 +347,8 @@ noreturn void chainload(char *config, char *cmdline) {
 
     struct fb_info *fbinfo;
     size_t fb_count;
-    fb_init(&fbinfo, &fb_count, req_width, req_height, req_bpp, false, false);
+    fb_init(&fbinfo, &fb_count, req_width, req_height, req_bpp,
+            !fb_flush_reliable(), false);
 
     size_t cmdline_len = strlen(cmdline);
     CHAR16 *new_cmdline;

@@ -185,8 +185,7 @@ struct madt_riscv_intc {
     uint32_t acpi_processor_uid;
 } __attribute__((packed));
 
-#define MADT_RISCV_INTC_ENABLED        ((uint32_t)1 << 0)
-#define MADT_RISCV_INTC_ONLINE_CAPABLE ((uint32_t)1 << 1)
+#define MADT_RISCV_INTC_ENABLED ((uint32_t)1 << 0)
 
 struct madt_core_pic {
     struct madt_header header;
@@ -197,7 +196,7 @@ struct madt_core_pic {
 } __attribute__((packed));
 
 #define MADT_CORE_PIC_ENABLED        ((uint32_t)1 << 0)
-#define MADT_CORE_PIC_ONLINE_CAPABLE ((uint32_t)1 << 1)
+#define MADT_CORE_PIC_ID_INVALID     ((uint32_t)0xFFFFFFFF)
 
 struct acpi_bgrt {
     struct sdt header;
@@ -216,6 +215,9 @@ void   *acpi_get_rsdp_v1(void);
 void   *acpi_get_rsdp_v2(void);
 
 void   *acpi_get_table(const char *signature, int index);
+#if defined (BIOS)
+void   *acpi_get_table_quiet(const char *signature, int index);
+#endif
 void    acpi_get_smbios(void **smbios32, void **smbios64);
 
 void acpi_map_tables(void);

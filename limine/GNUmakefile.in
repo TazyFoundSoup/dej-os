@@ -1,4 +1,5 @@
 .SUFFIXES:
+.DELETE_ON_ERROR:
 
 override SOURCE_DATE_EPOCH := @SOURCE_DATE_EPOCH@
 export SOURCE_DATE_EPOCH
@@ -23,9 +24,10 @@ override BINDIR := $(BUILDDIR)/bin
 override SRCDIR := @SRCDIR@
 
 override SPACE := $(subst ,, )
+override TAB := $(subst ,,	)
 override COMMA := ,
 
-override MKESCAPE = $(subst $(SPACE),\ ,$(1))
+override MKESCAPE = $(subst $(TAB),\$(TAB),$(subst $(SPACE),\ ,$(1)))
 override SHESCAPE = $(subst ','\'',$(1))
 override NASMESCAPE = $(subst ','"'$(COMMA) \"'\"$(COMMA) '"',$(1))
 
@@ -85,7 +87,7 @@ export LDFLAGS_FOR_TARGET
 NASMFLAGS_FOR_TARGET := @NASMFLAGS_FOR_TARGET@
 export NASMFLAGS_FOR_TARGET
 
-override STAGE1_FILES := $(shell find '$(call SHESCAPE,$(SRCDIR))/stage1' -type f -name '*.asm' | LC_ALL=C sort)
+override STAGE1_FILES := $(shell find '$(call SHESCAPE,$(SRCDIR))/stage1' -type f -name '*.asm' | LC_ALL=C sort | sed 's/[[:blank:]]/\\&/g')
 
 .PHONY: all
 all: $(call MKESCAPE,$(BINDIR))/Makefile
@@ -96,7 +98,7 @@ all1: $(BUILD_UEFI_X86_64) $(BUILD_UEFI_IA32) $(BUILD_UEFI_AARCH64) $(BUILD_UEFI
 	$(MAKE) '$(call SHESCAPE,$(BINDIR))/limine'
 	$(MAKE) '$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin'
 
-$(call MKESCAPE,$(BINDIR))/limine-bios-hdd.h: $(call MKESCAPE,$(BINDIR))/limine-bios-hdd.bin
+$(call MKESCAPE,$(BINDIR))/limine-bios-hdd.h: $(call MKESCAPE,$(BINDIR))/limine-bios-hdd.bin $(call MKESCAPE,$(SRCDIR))/host/hgen.sh
 	$(MKDIR_P) '$(call SHESCAPE,$(BINDIR))'
 	cd '$(call SHESCAPE,$(BINDIR))' && '$(call SHESCAPE,$(SRCDIR))/host/hgen.sh' >limine-bios-hdd.h
 
@@ -105,7 +107,7 @@ ifneq ($(BUILD_BIOS),limine-bios)
 override LIMINE_NO_BIOS := -DLIMINE_NO_BIOS
 endif
 
-$(call MKESCAPE,$(BINDIR))/limine: $(call MKESCAPE,$(BINDIR))/Makefile $(call MKESCAPE,$(SRCDIR))/host/limine.c $(if $(filter $(BUILD_BIOS),limine-bios),$(call MKESCAPE,$(BINDIR))/limine-bios-hdd.h)
+$(call MKESCAPE,$(BINDIR))/limine: $(call MKESCAPE,$(BUILDDIR))/GNUmakefile $(call MKESCAPE,$(BINDIR))/Makefile $(call MKESCAPE,$(SRCDIR))/host/limine.c $(if $(filter $(BUILD_BIOS),limine-bios),$(call MKESCAPE,$(BINDIR))/limine-bios-hdd.h)
 	$(SED) 's/%VERSION%/@PACKAGE_VERSION@/g;s/%COPYRIGHT%/@LIMINE_COPYRIGHT@/g' <'$(call SHESCAPE,$(SRCDIR))/host/limine.c' >'$(call SHESCAPE,$(BINDIR))/limine.c'
 	$(MAKE) -C '$(call SHESCAPE,$(BINDIR))' limine \
 		CC="$(CC)" \
@@ -208,6 +210,7 @@ $(call MKESCAPE,$(BINDIR))/limine-uefi-cd.bin: $(if $(BUILD_UEFI_IA32),$(call MK
 ifneq ($(BUILD_UEFI_CD),no)
 	$(MKDIR_P) '$(call SHESCAPE,$(BINDIR))'
 	rm -f '$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin'
+	TZ=UTC0; export TZ; \
 	LIMINE_UEFI_CD_TMP="$$(mktemp -d)"; \
 		mkdir -p "$$LIMINE_UEFI_CD_TMP"/EFI/BOOT; \
 		cp '$(call SHESCAPE,$(BUILDDIR))/common-uefi-aarch64/BOOTAA64.EFI' "$$LIMINE_UEFI_CD_TMP"/EFI/BOOT/ 2>/dev/null; \
@@ -216,9 +219,10 @@ ifneq ($(BUILD_UEFI_CD),no)
 		cp '$(call SHESCAPE,$(BUILDDIR))/common-uefi-x86-64/BOOTX64.EFI' "$$LIMINE_UEFI_CD_TMP"/EFI/BOOT/ 2>/dev/null; \
 		cp '$(call SHESCAPE,$(BUILDDIR))/common-uefi-ia32/BOOTIA32.EFI' "$$LIMINE_UEFI_CD_TMP"/EFI/BOOT/ 2>/dev/null; \
 		find "$$LIMINE_UEFI_CD_TMP" -exec touch -t $(SOURCE_DATE_EPOCH_TOUCH) '{}' + && \
-		LIMINE_UEFI_CD_SIZE="$$(du -sk "$$LIMINE_UEFI_CD_TMP" | $(AWK) '{ print $$1 }')" && \
-		LIMINE_UEFI_CD_SECTORS="$$(( (($$LIMINE_UEFI_CD_SIZE + 1023) / 1024 + 1) * 2048 ))" && \
-		mformat -C -i '$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin' -T "$$LIMINE_UEFI_CD_SECTORS" -N 12345678 :: && \
+		LIMINE_UEFI_CD_SIZE="$$(find "$$LIMINE_UEFI_CD_TMP" -type f -exec cat '{}' + | wc -c)" && \
+		LIMINE_UEFI_CD_SECTORS="$$(( (($$LIMINE_UEFI_CD_SIZE + 1048575) / 1048576 + 1) * 2048 ))" && \
+		dd if=/dev/zero of='$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin' bs=512 count="$$LIMINE_UEFI_CD_SECTORS" 2>/dev/null && \
+		mformat -i '$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin' -T "$$LIMINE_UEFI_CD_SECTORS" -N 12345678 :: && \
 		mcopy -D o -s -m -i '$(call SHESCAPE,$(BINDIR))/limine-uefi-cd.bin' "$$LIMINE_UEFI_CD_TMP"/EFI :: && \
 		rm -rf "$$LIMINE_UEFI_CD_TMP"
 endif
@@ -300,6 +304,7 @@ dist:
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/contrib"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/flanterm/.git"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/flanterm/.gitignore"
+	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/flanterm/.github"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/freestanding-c-hdrs/.git"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/limine-protocol/.git"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/picoefi/.git"
@@ -323,8 +328,11 @@ dist:
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/screenshot.png"
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/bochsrc"
 	echo "$(PACKAGE_VERSION)" > '$(call SHESCAPE,$(BUILDDIR))'/"$(DIST_OUTPUT)/version"
-	cd '$(call SHESCAPE,$(BUILDDIR))' && tar -cf "$(DIST_OUTPUT).tar" "$(DIST_OUTPUT)"
-	cd '$(call SHESCAPE,$(BUILDDIR))' && gzip < "$(DIST_OUTPUT).tar" > "$(DIST_OUTPUT).tar.gz"
+	cd '$(call SHESCAPE,$(BUILDDIR))' && find "$(DIST_OUTPUT)" ! -type d -perm -100 -exec chmod 755 '{}' +
+	cd '$(call SHESCAPE,$(BUILDDIR))' && find "$(DIST_OUTPUT)" ! -type d ! -perm -100 -exec chmod 644 '{}' +
+	cd '$(call SHESCAPE,$(BUILDDIR))' && TZ=UTC0 find "$(DIST_OUTPUT)" -exec touch -t $(SOURCE_DATE_EPOCH_TOUCH) '{}' +
+	cd '$(call SHESCAPE,$(BUILDDIR))' && tar -cf "$(DIST_OUTPUT).tar" $$(find "$(DIST_OUTPUT)" ! -type d | LC_ALL=C sort)
+	cd '$(call SHESCAPE,$(BUILDDIR))' && gzip -n < "$(DIST_OUTPUT).tar" > "$(DIST_OUTPUT).tar.gz"
 	cd '$(call SHESCAPE,$(BUILDDIR))' && ( bzip2 < "$(DIST_OUTPUT).tar" > "$(DIST_OUTPUT).tar.bz2" || rm -f "$(DIST_OUTPUT).tar.bz2" )
 	cd '$(call SHESCAPE,$(BUILDDIR))' && ( xz < "$(DIST_OUTPUT).tar" > "$(DIST_OUTPUT).tar.xz" || rm -f "$(DIST_OUTPUT).tar.xz" )
 	cd '$(call SHESCAPE,$(BUILDDIR))' && rm "$(DIST_OUTPUT).tar"
@@ -411,4 +419,4 @@ decompressor-clean:
 tools-clean:
 	rm -rf '$(call SHESCAPE,$(BUILDDIR))/tools-build'
 
--include test.mk
+-include $(call MKESCAPE,$(SRCDIR))/test.mk

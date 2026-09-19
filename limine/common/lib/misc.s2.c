@@ -2,9 +2,31 @@
 #include <stddef.h>
 #include <lib/misc.h>
 #include <lib/print.h>
+#include <lib/rand.h>
+
+// Reseeded at the entry point, before anything parses a disk.
+uintptr_t __stack_chk_guard = (uintptr_t)0x7a19f4c6e2b3d500ULL;
+
+void reseed_stack_guard(void) {
+    // A zero low byte stops string overflows from writing the canary intact.
+    __stack_chk_guard = safe_rand64() & ~(uintptr_t)0xff;
+}
+
+noreturn void __stack_chk_fail(void) {
+    panic(false, "Stack smashing detected");
+}
+
+#if defined (__i386__)
+// GCC routes the check in 32-bit PIC code through a hidden alias so the call
+// does not have to go through the PLT. Nothing provides it here.
+noreturn void __stack_chk_fail_local(void) {
+    __stack_chk_fail();
+}
+#endif
 
 bool verbose = false;
 bool quiet = false;
+bool terse = false;
 bool serial = false;
 bool hash_mismatch_panic = false;
 bool measured_boot = false;

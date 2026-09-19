@@ -5,10 +5,13 @@
 // noreturn void enter_in_el1(uint64_t entry, uint64_t sp, uint64_t sctlr,
 //                            uint64_t mair, uint64_t tcr, uint64_t ttbr0,
 //                            uint64_t ttbr1, uint64_t direct_map_offset)
-// Configure EL1 state and jump to kernel. Must be called at EL1.
+// Configure EL1 state and jump to kernel. Called at EL1, or at EL2 without
+// VHE, in which case it drops to EL1 on the way.
 
 .global enter_in_el1
 enter_in_el1:
+    PICK_EL x8, 0f, 2f
+0:
     msr spsel, #0
     mov sp, x1
 
@@ -24,12 +27,12 @@ enter_in_el1:
     dsb sy
     isb
 
-    // Switch the page table registers
+    // Switch the page table registers. TTBR1 has to be live before anything
+    // can fault, the vector above being a higher half address, and TCR goes
+    // last because it is the write that breaks the fetches in progress.
     msr mair_el1, x3
-    msr tcr_el1, x4
-    msr ttbr0_el1, x5
     msr ttbr1_el1, x6
-    msr sctlr_el1, x2
+    msr tcr_el1, x4
     isb
     dsb sy
     isb
@@ -40,6 +43,17 @@ enter_in_el1:
 // Alignment required by VBAR register
 .align 11
 1:
+    // Completed here so that they are reached whether the switch faulted or
+    // fell through.
+    msr ttbr0_el1, x5
+    msr sctlr_el1, x2
+    isb
+
+    // The firmware's entries are global, so no ASID change retires them.
+    tlbi vmalle1
+    dsb nsh
+    isb
+
     // Zero out VBAR to avoid confusion
     msr vbar_el1, xzr
 
@@ -53,6 +67,37 @@ enter_in_el1:
 
     mov x0, xzr
     ZERO_REGS_EXCEPT_X0
+
+    eret
+
+2:
+    // At EL2 without VHE the EL1 registers are inactive, so the state goes in
+    // whole and the ERET brings it into use, with nothing switched underneath.
+    msr sp_el0, x1
+
+    msr mair_el1, x3
+    msr tcr_el1, x4
+    msr ttbr0_el1, x5
+    msr ttbr1_el1, x6
+    msr sctlr_el1, x2
+
+    INIT_EL2_FOR_EL1 x8, x9
+
+    // The regime only comes into use at the ERET, so retire anything stale
+    // under the VMID selected above before it does.
+    tlbi vmalle1
+    dsb nsh
+    isb
+
+    // The tail is reachable in the higher half once the ERET brings TTBR1_EL1
+    // into use.
+    adrp x8, 1b
+    add x8, x8, #:lo12:1b
+    add x8, x8, x7
+    msr elr_el2, x8
+
+    mov x8, #0x3c4
+    msr spsr_el2, x8
 
     eret
 
@@ -85,12 +130,11 @@ enter_in_el2:
     dsb sy
     isb
 
-    // Switch the page table registers (VHE redirects to EL2)
+    // Switch the page table registers (VHE redirects to EL2), ordered as in
+    // enter_in_el1 above and for the same reason.
     msr mair_el1, x3
-    msr tcr_el1, x4
-    msr ttbr0_el1, x5
     msr ttbr1_el1, x6
-    msr sctlr_el1, x2
+    msr tcr_el1, x4
     isb
     dsb sy
     isb
@@ -101,6 +145,13 @@ enter_in_el2:
 // Alignment required by VBAR register
 .align 11
 5:
+    // Completed here so that they are reached whether the switch faulted or
+    // fell through, and while HCR_EL2 still has the value the writes above
+    // were redirected under.
+    msr ttbr0_el1, x5
+    msr sctlr_el1, x2
+    isb
+
     // Zero out VBAR to avoid confusion
     msr vbar_el1, xzr
 
@@ -114,6 +165,13 @@ enter_in_el2:
     // HCR: E2H + TGE + RW + SWIO
     ldr x8, =0x488000002
     msr hcr_el2, x8
+    isb
+
+    // Must follow the write above: VMALLE1 reaches EL2&0 only once E2H and
+    // TGE are both set, and EL1&0 before that.
+    tlbi vmalle1
+    dsb nsh
+    isb
 
     // Disable FP/SIMD/SVE (VHE CPTR_EL2 layout, CPACR-like)
     msr cptr_el2, xzr
@@ -128,5 +186,3 @@ enter_in_el2:
     ZERO_REGS_EXCEPT_X0
 
     eret
-
-.section .note.GNU-stack,"",%progbits

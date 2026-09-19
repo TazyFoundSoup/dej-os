@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
+#include <lib/misc.h>
 
 #if defined(__x86_64__) || defined(__i386__)
 
@@ -252,6 +253,10 @@ static inline uint64_t tsc_freq_arch(void) {
     ); \
 } while (0)
 
+static inline void sync_icache_range(uintptr_t start, uintptr_t end) {
+    (void)start; (void)end;
+}
+
 #elif defined (__aarch64__)
 
 static inline uint64_t rdtsc(void) {
@@ -339,6 +344,11 @@ static inline int current_el(void) {
     return v;
 }
 
+static inline void sync_icache_range(uintptr_t start, uintptr_t end) {
+    clean_dcache_poc(start, end);
+    inval_icache_pou(start, end);
+}
+
 #elif defined (__riscv)
 
 static inline uint64_t rdtsc(void) {
@@ -385,6 +395,7 @@ struct riscv_hart {
     const char *isa_string;
     size_t hartid;
     uint32_t acpi_uid;
+    uint32_t cbom_block_size;
     uint8_t mmu_type;
     uint8_t flags;
 };
@@ -397,11 +408,18 @@ extern struct riscv_hart *bsp_hart;
 
 bool riscv_check_isa_extension_for(size_t hartid, const char *ext, size_t *maj, size_t *min);
 
+size_t riscv_cbom_block_size(void);
+
 static inline bool riscv_check_isa_extension(const char *ext, size_t *maj, size_t *min) {
     return riscv_check_isa_extension_for(bsp_hartid, ext, maj, min);
 }
 
 void init_riscv(const char *config);
+
+static inline void sync_icache_range(uintptr_t start, uintptr_t end) {
+    (void)start; (void)end;
+    asm volatile ("fence.i" ::: "memory");
+}
 
 #elif defined (__loongarch64)
 
@@ -518,6 +536,11 @@ static inline uint64_t tsc_freq_arch(void) {
     return (uint64_t)cc_freq * cc_mul / cc_div;
 }
 
+static inline void sync_icache_range(uintptr_t start, uintptr_t end) {
+    (void)start; (void)end;
+    asm volatile ("ibar 0" ::: "memory");
+}
+
 #else
 #error Unknown architecture
 #endif
@@ -532,6 +555,29 @@ static inline uint64_t rdtsc_usec(void) {
     }
     return exec_ticks / tsc_freq * 1000000
          + exec_ticks % tsc_freq * 1000000 / tsc_freq;
+}
+
+static inline uint64_t rdtsc_deadline(uint64_t us) {
+    if (tsc_freq == 0) {
+        return 0;
+    }
+
+    uint64_t seconds = us / 1000000;
+    uint64_t remainder = us % 1000000;
+
+    uint64_t ticks = CHECKED_MUL(seconds, tsc_freq, return UINT64_MAX);
+
+    uint64_t remainder_ticks = CHECKED_MUL(remainder, tsc_freq / 1000000, return UINT64_MAX);
+    remainder_ticks += remainder * (tsc_freq % 1000000) / 1000000;
+
+    ticks = CHECKED_ADD(ticks, remainder_ticks, return UINT64_MAX);
+
+    uint64_t now = rdtsc();
+    return CHECKED_ADD(now, ticks, return UINT64_MAX);
+}
+
+static inline bool rdtsc_deadline_expired(uint64_t deadline) {
+    return deadline != 0 && rdtsc() >= deadline;
 }
 
 static inline void stall(uint64_t us) {
@@ -550,6 +596,22 @@ static inline const char *current_arch(void) {
     } else {
         return "x86-64";
     }
+#elif defined (__aarch64__)
+    return "aarch64";
+#elif defined (__riscv)
+    return "riscv64";
+#elif defined (__loongarch64)
+    return "loongarch64";
+#else
+#error "Unspecified architecture"
+#endif
+}
+
+static inline const char *loader_arch(void) {
+#if defined (__x86_64__)
+    return "x86-64";
+#elif defined (__i386__)
+    return "ia-32";
 #elif defined (__aarch64__)
     return "aarch64";
 #elif defined (__riscv)

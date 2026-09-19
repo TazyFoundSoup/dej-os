@@ -42,6 +42,8 @@ $(IMAGE): $(KERNEL) limine.conf
 
 	dd if=/dev/zero of=$@ bs=1M count=64
 
+	cd $(LIMINE_DIR)    && make
+
 	sgdisk -Z $@
 	sgdisk -n 1:2048:4095 -t 1:ef02 $@
 	sgdisk -n 2:4096:0 -t 2:ef00 $@

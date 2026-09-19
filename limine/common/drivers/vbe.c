@@ -154,35 +154,10 @@ struct fb_info *vbe_get_mode_list(size_t *count) {
     uint16_t *vid_modes = (uint16_t *)rm_desegment(vbe_info.vid_modes_seg,
                                                    vbe_info.vid_modes_off);
 
-    size_t modes_count = 0;
+    struct fb_info *ret = ext_mem_alloc_counted(VBE_MAX_MODES, sizeof(struct fb_info));
+
+    size_t j = 0;
     for (size_t i = 0; i < VBE_MAX_MODES && vid_modes[i] != 0xffff; i++) {
-        struct vbe_mode_info_struct vbe_mode_info;
-        if (!get_vbe_mode_info(&vbe_mode_info, vid_modes[i])) {
-            continue;
-        }
-
-        // We only support RGB for now
-        if (vbe_mode_info.memory_model != 0x06)
-            continue;
-        // We only support linear modes
-        if (!(vbe_mode_info.mode_attributes & (1 << 7)))
-            continue;
-
-        uint16_t pitch = (vbe_info.version_maj < 3)
-                       ? vbe_mode_info.bytes_per_scanline
-                       : vbe_mode_info.lin_bytes_per_scanline;
-        uint16_t bytes_per_pixel = vbe_mode_info.bpp / 8;
-        if (bytes_per_pixel == 0
-         || pitch % bytes_per_pixel != 0
-         || pitch < (uint32_t)vbe_mode_info.res_x * bytes_per_pixel)
-            continue;
-
-        modes_count++;
-    }
-
-    struct fb_info *ret = ext_mem_alloc_counted(modes_count, sizeof(struct fb_info));
-
-    for (size_t i = 0, j = 0; i < VBE_MAX_MODES && vid_modes[i] != 0xffff; i++) {
         struct vbe_mode_info_struct vbe_mode_info;
         if (!get_vbe_mode_info(&vbe_mode_info, vid_modes[i])) {
             continue;
@@ -231,7 +206,13 @@ struct fb_info *vbe_get_mode_list(size_t *count) {
         j++;
     }
 
-    *count = modes_count;
+    struct fb_info *tmp = ext_mem_alloc_counted(j, sizeof(struct fb_info));
+    memcpy(tmp, ret, j * sizeof(struct fb_info));
+
+    pmm_free(ret, VBE_MAX_MODES * sizeof(struct fb_info));
+    ret = tmp;
+
+    *count = j;
 
     return ret;
 }
@@ -257,6 +238,7 @@ bool init_vbe(struct fb_info *ret,
                                                    vbe_info.vid_modes_off);
 
     struct resolution fallback_resolutions[] = {
+        { 0,    0,   0  },   // Overridden by EDID
         { 1024, 768, 32 },
         { 800,  600, 32 },
         { 640,  480, 32 },
@@ -269,21 +251,6 @@ bool init_vbe(struct fb_info *ret,
     };
 
     if (!target_width || !target_height || !target_bpp) {
-        struct edid_info_struct *edid_info = get_edid_info();
-        if (edid_info != NULL) {
-            int edid_width   = (int)edid_info->det_timing_desc1[2];
-                edid_width  += ((int)edid_info->det_timing_desc1[4] & 0xf0) << 4;
-            int edid_height  = (int)edid_info->det_timing_desc1[5];
-                edid_height += ((int)edid_info->det_timing_desc1[7] & 0xf0) << 4;
-            if (edid_width && edid_height) {
-                target_width  = edid_width;
-                target_height = edid_height;
-                target_bpp    = 32;
-                printv("vbe: EDID detected screen resolution of %ux%u\n",
-                       target_width, target_height);
-                goto retry;
-            }
-        }
         goto fallback;
     } else {
         printv("vbe: Requested resolution of %ux%ux%u\n",
@@ -354,6 +321,26 @@ retry:
     }
 
 fallback:
+    if (current_fallback == 0) {
+        current_fallback++;
+
+        struct edid_info_struct *edid_info = get_edid_info();
+        if (edid_info != NULL) {
+            int edid_width   = (int)edid_info->det_timing_desc1[2];
+                edid_width  += ((int)edid_info->det_timing_desc1[4] & 0xf0) << 4;
+            int edid_height  = (int)edid_info->det_timing_desc1[5];
+                edid_height += ((int)edid_info->det_timing_desc1[7] & 0xf0) << 4;
+            if (edid_width && edid_height) {
+                target_width  = edid_width;
+                target_height = edid_height;
+                target_bpp    = 32;
+                printv("vbe: EDID detected screen resolution of %ux%u\n",
+                       target_width, target_height);
+                goto retry;
+            }
+        }
+    }
+
     if (current_fallback < SIZEOF_ARRAY(fallback_resolutions)) {
         target_width  = fallback_resolutions[current_fallback].width;
         target_height = fallback_resolutions[current_fallback].height;

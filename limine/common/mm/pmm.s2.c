@@ -25,6 +25,10 @@ void *conv_mem_alloc(uint64_t count) {
     if (allocations_disallowed)
         panic(false, "Memory allocations disallowed");
 
+    if (count == 0) {
+        count = 1;
+    }
+
     count = ALIGN_UP(count, 4096, panic(false, "Alignment overflow"));
 
     for (;;) {
@@ -143,7 +147,13 @@ void pmm_sanitise_entries(struct memmap_entry *m, size_t *_count, bool align_ent
             uint64_t res_length = m[j].length;
             uint64_t res_top    = CHECKED_ADD(res_base, res_length, continue);
 
-            // Non-usable entry fully contains usable entry
+            // An empty entry overlaps nothing: split against one, a usable
+            // entry reproduces itself and the walk never settles.
+            if (res_length == 0) {
+                continue;
+            }
+
+            // Another entry fully contains the usable entry
             if (res_base <= base && res_top >= top) {
                 m[i].base   = top;
                 m[i].length = 0;
@@ -152,8 +162,16 @@ void pmm_sanitise_entries(struct memmap_entry *m, size_t *_count, bool align_ent
 
             if ( (res_base >= base && res_base < top)
               && (res_top  >= base && res_top  < top) ) {
-                // TODO actually handle splitting off usable chunks
-                panic(false, "A non-usable memory map entry is inside a usable section.");
+                if (count >= memmap_max_entries) {
+                    panic(false, "Memory map exhausted.");
+                }
+
+                m[count] = m[i];
+                m[count].base = res_top;
+                m[count].length = top - res_top;
+                count++;
+
+                top = res_base;
             }
 
             if (res_base >= base && res_base < top) {
@@ -217,10 +235,12 @@ del_mm1:
         m[p] = min_e;
     }
 
-    // Merge contiguous bootloader-reclaimable, reserved (mapped), usable entries
+    // Merge contiguous bootloader-reclaimable, reserved (mapped),
+    // kernel/modules, usable entries
     for (size_t i = 0; i + 1 < count; i++) {
         if (m[i].type != MEMMAP_BOOTLOADER_RECLAIMABLE
          && m[i].type != MEMMAP_RESERVED_MAPPED
+         && m[i].type != MEMMAP_KERNEL_AND_MODULES
          && m[i].type != MEMMAP_USABLE)
             continue;
 
@@ -308,6 +328,84 @@ static struct memmap_entry *recl;
 
 extern symbol __slide, __image_base, __image_end;
 
+// Some UEFI implementations cannot handle allocations spanning a large
+// fraction of physical memory. Reduce the request cap no lower than 64MiB,
+// and use 1MiB requests only to recover a failed chunk.
+#define UEFI_ALLOC_MAX_PAGES      ((UINTN)(0x40000000 / PAGE_SIZE))
+#define UEFI_ALLOC_MIN_PAGES      ((UINTN)(0x04000000 / PAGE_SIZE))
+#define UEFI_ALLOC_FALLBACK_PAGES ((UINTN)(0x00100000 / PAGE_SIZE))
+
+static UINTN uefi_alloc_chunk_pages = UEFI_ALLOC_MAX_PAGES;
+
+static void pmm_mark_uefi_pages_unclaimed(EFI_PHYSICAL_ADDRESS base,
+                                          UINTN page_count) {
+    memmap_alloc_range(base, (uint64_t)page_count * PAGE_SIZE,
+                       MEMMAP_EFI_RECLAIMABLE, MEMMAP_USABLE,
+                       true, false, false);
+}
+
+static void pmm_claim_uefi_pages_fallback(EFI_PHYSICAL_ADDRESS base,
+                                          UINTN page_count, UINTN step_pages) {
+    EFI_PHYSICAL_ADDRESS failed_base = 0;
+    UINTN failed_pages = 0;
+
+    while (page_count != 0) {
+        UINTN chunk_pages = MIN(page_count, step_pages);
+        EFI_PHYSICAL_ADDRESS alloc_base = base;
+        EFI_STATUS status = gBS->AllocatePages(AllocateAddress,
+                                               EfiLoaderCode,
+                                               chunk_pages,
+                                               &alloc_base);
+
+        if (status && chunk_pages > 1) {
+            // One refused page must not cost the whole chunk.
+            pmm_claim_uefi_pages_fallback(base, chunk_pages, 1);
+        } else if (status) {
+            if (failed_pages == 0) {
+                failed_base = base;
+            }
+            failed_pages += chunk_pages;
+        } else if (failed_pages != 0) {
+            pmm_mark_uefi_pages_unclaimed(failed_base, failed_pages);
+            failed_pages = 0;
+        }
+
+        base += (uint64_t)chunk_pages * PAGE_SIZE;
+        page_count -= chunk_pages;
+    }
+
+    if (failed_pages != 0) {
+        pmm_mark_uefi_pages_unclaimed(failed_base, failed_pages);
+    }
+}
+
+static void pmm_claim_uefi_pages(EFI_PHYSICAL_ADDRESS base, UINTN page_count) {
+    while (page_count != 0) {
+        UINTN chunk_pages = MIN(page_count, uefi_alloc_chunk_pages);
+        EFI_PHYSICAL_ADDRESS alloc_base = base;
+        EFI_STATUS status = gBS->AllocatePages(AllocateAddress,
+                                               EfiLoaderCode,
+                                               chunk_pages,
+                                               &alloc_base);
+
+        if (status && chunk_pages > UEFI_ALLOC_MIN_PAGES) {
+            UINTN new_chunk_pages = MAX(chunk_pages / 2,
+                                        UEFI_ALLOC_MIN_PAGES);
+            uefi_alloc_chunk_pages = MIN(uefi_alloc_chunk_pages,
+                                         new_chunk_pages);
+            continue;
+        }
+
+        if (status) {
+            pmm_claim_uefi_pages_fallback(base, chunk_pages,
+                                          UEFI_ALLOC_FALLBACK_PAGES);
+        }
+
+        base += (uint64_t)chunk_pages * PAGE_SIZE;
+        page_count -= chunk_pages;
+    }
+}
+
 void init_memmap(void) {
     EFI_STATUS status;
 
@@ -316,6 +414,12 @@ void init_memmap(void) {
     UINTN mmap_key = 0;
 
     gBS->GetMemoryMap(&efi_mmap_size, tmp_mmap, &mmap_key, &efi_desc_size, &efi_desc_ver);
+
+    // EFI_BUFFER_TOO_SMALL promises only MemoryMapSize, so the descriptor size
+    // this call reports has to be checked before it is divided by.
+    if (efi_desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) {
+        goto fail;
+    }
 
     memmap_max_entries = (efi_mmap_size / efi_desc_size) + 512;
 
@@ -342,7 +446,10 @@ void init_memmap(void) {
     }
 
     status = gBS->GetMemoryMap(&efi_mmap_size, efi_mmap, &mmap_key, &efi_desc_size, &efi_desc_ver);
-    if (status) {
+
+    // GetMemoryMap() reports a descriptor size per call, and it is this one the
+    // walk below strides by.
+    if (status || efi_desc_size < sizeof(EFI_MEMORY_DESCRIPTOR)) {
         gBS->FreePool(efi_mmap);
         gBS->FreePool(memmap);
         gBS->FreePool(untouched_memmap);
@@ -421,18 +528,7 @@ void init_memmap(void) {
         }
 #endif
 
-        status = gBS->AllocatePages(AllocateAddress, EfiLoaderCode,
-                                    untouched_memmap[i].length / 4096, &base);
-
-        if (status) {
-            for (size_t j = 0; j < untouched_memmap[i].length; j += 4096) {
-                base = untouched_memmap[i].base + j;
-                status = gBS->AllocatePages(AllocateAddress, EfiLoaderCode, 1, &base);
-                if (status) {
-                    memmap_alloc_range(base, 4096, MEMMAP_EFI_RECLAIMABLE, MEMMAP_USABLE, true, false, false);
-                }
-            }
-        }
+        pmm_claim_uefi_pages(base, untouched_memmap[i].length / PAGE_SIZE);
     }
 
     memcpy(untouched_memmap, memmap, memmap_entries * sizeof(struct memmap_entry));
@@ -561,6 +657,10 @@ struct memmap_entry *get_raw_memmap(size_t *entry_count) {
     *entry_count = e820_entries;
     return e820_map;
 }
+
+size_t get_raw_memmap_max_entries(void) {
+    return MAX_E820_ENTRIES;
+}
 #endif
 
 #if defined (UEFI)
@@ -577,6 +677,10 @@ struct memmap_entry *get_raw_memmap(size_t *entry_count) {
     *entry_count = untouched_memmap_entries;
     return untouched_memmap;
 }
+
+size_t get_raw_memmap_max_entries(void) {
+    return memmap_max_entries;
+}
 #endif
 
 void pmm_free_size_t(void *ptr, size_t length) {
@@ -584,8 +688,15 @@ void pmm_free_size_t(void *ptr, size_t length) {
 }
 
 void pmm_free(void *ptr, uint64_t count) {
+    if (ptr == NULL) {
+        return;
+    }
+
     if ((uintptr_t)ptr % 4096 != 0)
         panic(false, "pmm_free: Unaligned pointer %p", ptr);
+    if (count == 0) {
+        count = 1;
+    }
     count = ALIGN_UP(count, 4096, panic(false, "Alignment overflow"));
     if (allocations_disallowed)
         panic(false, "Memory allocations disallowed");
@@ -593,12 +704,6 @@ void pmm_free(void *ptr, uint64_t count) {
 }
 
 void *pmm_realloc(void *old_ptr, uint64_t old_size, uint64_t new_size) {
-    if (new_size == 0) {
-        if (old_ptr != NULL) {
-            pmm_free(old_ptr, old_size);
-        }
-        return NULL;
-    }
     if (old_ptr == NULL) {
         return ext_mem_alloc(new_size);
     }
@@ -638,6 +743,13 @@ void *ext_mem_alloc_type_aligned_mode(uint64_t count, uint32_t type, size_t alig
 #if !defined (__x86_64__) && !defined (__i386__)
     (void)allow_high_allocs;
 #endif
+
+    // A zero-size request must still own storage: at zero the reservation
+    // below is a no-op, and the pointer returned aliases whatever already
+    // sits at the top of the region.
+    if (count == 0) {
+        count = 1;
+    }
 
     count = CHECKED_ADD(count, alignment - 1,
         panic(false, "ext_mem_alloc: count overflows when aligning"));

@@ -1,3 +1,5 @@
+.DELETE_ON_ERROR:
+
 override CC := $(CC_FOR_TARGET)
 override CFLAGS := -O2 -g -Wall -Wextra
 override LDFLAGS :=
@@ -87,6 +89,7 @@ ifeq ($(ARCH),aarch64)
 override CFLAGS += \
     -mcpu=generic \
     -march=armv8-a+nofp+nosimd \
+    -mno-outline-atomics \
     -mgeneral-regs-only
 endif
 
@@ -103,11 +106,16 @@ ifeq ($(ARCH),loongarch64)
 override CFLAGS += \
     -march=loongarch64 \
     -mabi=lp64s \
+    -mno-relax \
     -mfpu=none \
     -msimd=none
+override LDFLAGS += \
+    --no-relax
 endif
 
 override CFLAGS_MB := \
+    -Wall \
+    -Wextra \
     -std=c11 \
     -nostdinc \
     -ffreestanding \
@@ -138,17 +146,30 @@ flanterm_fb.o: ../flanterm/src/flanterm_backends/fb.c
 test.elf: limine.o e9print.o memory.o flanterm.o flanterm_fb.o
 	$(LD) $(LDFLAGS) $^ -o $@
 
-multiboot2.elf: multiboot2_trampoline.o
-	$(CC) $(CFLAGS_MB) -c memory.c -o memory.o
-	$(CC) $(CFLAGS_MB) -c multiboot2.c -o multiboot2.o
-	$(CC) $(CFLAGS_MB) -c e9print.c -o e9print.o
-	$(LD) $(LDFLAGS_MB2) $^ memory.o multiboot2.o e9print.o -o $@
+# The compiler emits calls to the 64-bit division helpers, which a freestanding
+# link has nothing else to satisfy.
+cc-runtime.mb.o: ../common/cc-runtime.s2.c
+	$(CC) $(CFLAGS_MB) -c $< -o $@
 
-multiboot.elf: multiboot_trampoline.o
-	$(CC) $(CFLAGS_MB) -c memory.c -o memory.o
-	$(CC) $(CFLAGS_MB) -c multiboot.c -o multiboot.o
-	$(CC) $(CFLAGS_MB) -c e9print.c -o e9print.o
-	$(LD) $(LDFLAGS_MB1) $^ memory.o multiboot.o e9print.o -o $@
+# These are 32-bit where test.elf's objects are not, so they need names of
+# their own.
+memory.mb.o: memory.c
+	$(CC) $(CFLAGS_MB) -c $< -o $@
+
+e9print.mb.o: e9print.c
+	$(CC) $(CFLAGS_MB) -c $< -o $@
+
+multiboot.o: multiboot.c
+	$(CC) $(CFLAGS_MB) -c $< -o $@
+
+multiboot2.o: multiboot2.c
+	$(CC) $(CFLAGS_MB) -c $< -o $@
+
+multiboot2.elf: multiboot2_trampoline.o cc-runtime.mb.o memory.mb.o multiboot2.o e9print.mb.o
+	$(LD) $(LDFLAGS_MB2) $^ -o $@
+
+multiboot.elf: multiboot_trampoline.o cc-runtime.mb.o memory.mb.o multiboot.o e9print.mb.o
+	$(LD) $(LDFLAGS_MB1) $^ -o $@
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -159,5 +180,6 @@ multiboot.elf: multiboot_trampoline.o
 clean:
 	rm -rf test.elf limine.o e9print.o memory.o
 	rm -rf flanterm.o flanterm_fb.o
+	rm -rf e9print.mb.o memory.mb.o cc-runtime.mb.o
 	rm -rf multiboot2.o multiboot2.elf multiboot2_trampoline.o
 	rm -rf multiboot.o multiboot_trampoline.o multiboot.elf

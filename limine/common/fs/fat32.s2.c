@@ -17,7 +17,6 @@
 struct fat32_context {
     struct volume *part;
     int type;
-    char *label;
     uint16_t bytes_per_sector;
     uint8_t sectors_per_cluster;
     uint16_t reserved_sectors;
@@ -222,31 +221,6 @@ bytes_per_sector_valid:;
             __builtin_unreachable();
     }
 
-    // get the volume label
-    struct fat32_directory_entry _current_directory;
-    struct fat32_directory_entry *current_directory;
-
-    switch (context->type) {
-        case 12:
-        case 16:
-            current_directory = NULL;
-            break;
-        case 32:
-            _current_directory.cluster_num_low = context->root_directory_cluster & 0xFFFF;
-            _current_directory.cluster_num_high = context->root_directory_cluster >> 16;
-            current_directory = &_current_directory;
-            break;
-        default:
-            __builtin_unreachable();
-    }
-
-    char *vol_label;
-    if (fat32_open_in(context, current_directory, (struct fat32_directory_entry *)&vol_label, NULL) == 0) {
-        context->label = vol_label;
-    } else {
-        context->label = NULL;
-    }
-
     return 0;
 }
 
@@ -322,9 +296,42 @@ static uint32_t *cache_cluster_chain(struct fat32_context *context,
         max_clusters = FAT32_MAX_CHAIN_LENGTH;
     }
 
+    // Every cluster in a chain has an entry in the FAT, so a chain longer than
+    // the FAT has entries must repeat one.
+    uint64_t fat_size = (uint64_t)context->sectors_per_fat * context->bytes_per_sector;
+    uint64_t fat_entries;
+    if (context->type == 12) {
+        fat_entries = (fat_size * 2) / 3;
+    } else if (context->type == 16) {
+        fat_entries = fat_size / sizeof(uint16_t);
+    } else {
+        fat_entries = fat_size / sizeof(uint32_t);
+    }
+    if (fat_entries < max_clusters) {
+        max_clusters = fat_entries;
+    }
+
+    // The bound above comes from the filesystem; this one comes from the medium,
+    // which is what shrinking a partition moves and the BPB does not follow.
+    uint64_t readable_cluster_limit = cluster_limit;
+    if (context->part->sect_count != (uint64_t)-1) {
+        uint64_t volume_sectors = CHECKED_MUL((uint64_t)context->part->sect_count, 512, return NULL)
+                                / context->bytes_per_sector;
+        uint64_t data_clusters = 0;
+        if (volume_sectors > context->data_start_lba) {
+            data_clusters = (volume_sectors - context->data_start_lba) / context->sectors_per_cluster;
+        }
+        if (data_clusters + 1 < readable_cluster_limit) {
+            readable_cluster_limit = data_clusters + 1;
+        }
+    }
+
     uint32_t cluster = initial_cluster;
     size_t chain_length;
     for (chain_length = 1; chain_length <= max_clusters; chain_length++) {
+        if (cluster > readable_cluster_limit) {
+            return NULL;
+        }
         if (read_cluster_from_map(context, cluster, &cluster) != 0) {
             return NULL;
         }
@@ -385,6 +392,18 @@ static bool read_cluster_chain(struct fat32_context *context,
     return true;
 }
 
+// FAT specification 7.2: an unsigned char rotate right accumulated over all 11
+// bytes of the short name.
+static uint8_t fat32_lfn_checksum(const char *sfn) {
+    uint8_t sum = 0;
+
+    for (int i = 0; i < 11; i++) {
+        sum = ((sum & 1) ? 0x80 : 0) + (sum >> 1) + (uint8_t)sfn[i];
+    }
+
+    return sum;
+}
+
 // Copy ucs-2 characters to char*, with bounds checking
 static void fat32_lfncpy(char* destination, size_t dest_size, size_t dest_offset,
                          const void* source, unsigned int size) {
@@ -429,6 +448,7 @@ static int fat32_open_in(struct fat32_context* context, struct fat32_directory_e
     size_t block_size = context->sectors_per_cluster * context->bytes_per_sector;
     char current_lfn[FAT32_LFN_MAX_FILENAME_LENGTH] = {0};
     unsigned int lfn_expected = 0;
+    uint8_t lfn_checksum = 0;
 
     size_t dir_chain_len;
     struct fat32_directory_entry *directory_entries;
@@ -520,10 +540,12 @@ static int fat32_open_in(struct fat32_context* context, struct fat32_directory_e
                 // this lfn is the first entry in the table, clear the lfn buffer
                 memset(current_lfn, ' ', sizeof(current_lfn));
                 lfn_expected = seq_num;
+                lfn_checksum = lfn->dos_checksum;
             }
 
-            if (seq_num == 0 || seq_num != lfn_expected) {
-                lfn_expected = 0;  // Invalidate: out of order or gap
+            if (seq_num == 0 || seq_num != lfn_expected
+             || lfn->dos_checksum != lfn_checksum) {
+                lfn_expected = 0;  // Invalidate: out of order, gap, or mixed set
                 continue;
             }
             lfn_expected--;
@@ -552,19 +574,22 @@ static int fat32_open_in(struct fat32_context* context, struct fat32_directory_e
             int (*strcmpfn)(const char *, const char *) = case_insensitive_fopen ? strcasecmp : strcmp;
 
             if (strcmpfn(current_lfn, name) == 0) {
-                // Ensure i+1 is within bounds before accessing
+                // A set that does not validly name the entry after it decides
+                // nothing: the name being looked for can still appear further
+                // down the directory, so keep scanning rather than give up.
                 if (i + 1 >= (dir_chain_len * block_size) / sizeof(struct fat32_directory_entry)) {
-                    ret = -1;
-                    goto out;
+                    lfn_expected = 0;
+                    continue;
                 }
-                // Validate that the next entry is a valid SFN entry (not LFN, deleted, or end-of-dir)
+                // The next entry has to be a short entry, and has to be the one
+                // this set was created for.
                 struct fat32_directory_entry *sfn_entry = &directory_entries[i+1];
-                if (sfn_entry->file_name_and_ext[0] == 0x00 ||
-                    (uint8_t)sfn_entry->file_name_and_ext[0] == 0xE5 ||
-                    sfn_entry->attribute == FAT32_LFN_ATTRIBUTE) {
-                    // Corrupted LFN sequence - expected SFN entry not found
-                    ret = -1;
-                    goto out;
+                if (sfn_entry->file_name_and_ext[0] == 0x00
+                 || (uint8_t)sfn_entry->file_name_and_ext[0] == 0xE5
+                 || sfn_entry->attribute == FAT32_LFN_ATTRIBUTE
+                 || fat32_lfn_checksum(sfn_entry->file_name_and_ext) != lfn_checksum) {
+                    lfn_expected = 0;
+                    continue;
                 }
                 *file = *sfn_entry;
                 ret = 0;
@@ -602,7 +627,29 @@ char *fat32_get_label(struct volume *part) {
         return NULL;
     }
 
-    return context.label;
+    struct fat32_directory_entry _current_directory;
+    struct fat32_directory_entry *current_directory;
+
+    switch (context.type) {
+        case 12:
+        case 16:
+            current_directory = NULL;
+            break;
+        case 32:
+            _current_directory.cluster_num_low = context.root_directory_cluster & 0xFFFF;
+            _current_directory.cluster_num_high = context.root_directory_cluster >> 16;
+            current_directory = &_current_directory;
+            break;
+        default:
+            __builtin_unreachable();
+    }
+
+    char *label;
+    if (fat32_open_in(&context, current_directory, (struct fat32_directory_entry *)&label, NULL) != 0) {
+        return NULL;
+    }
+
+    return label;
 }
 
 static uint64_t fat32_read(struct file_handle *handle, void *buf, uint64_t loc, uint64_t count);
@@ -699,7 +746,10 @@ struct file_handle *fat32_open(struct volume *part, const char *path) {
             ret->chain_len = 0;
             ret->cluster_chain = cache_cluster_chain(&context, ret->first_cluster, &ret->chain_len);
 
-            if (ret->cluster_chain == NULL && ret->size_bytes != 0) {
+            uint64_t block_size = (uint64_t)context.sectors_per_cluster * (uint64_t)context.bytes_per_sector;
+
+            if (ret->size_bytes > (uint64_t)ret->chain_len * block_size) {
+                pmm_free(ret->cluster_chain, ret->chain_len * sizeof(uint32_t));
                 pmm_free(ret, sizeof(struct fat32_file_handle));
                 pmm_free(handle, sizeof(struct file_handle));
                 return NULL;

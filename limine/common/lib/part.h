@@ -48,6 +48,12 @@ struct volume {
     uint8_t *cache;
     uint64_t cached_block;
 
+    // Built on the first logical partition probe and kept for the rest.
+    struct volume *ebr_part;
+    int ebr_walk_index;
+    uint64_t ebr_walk_sector;
+    uint64_t ebr_walk_size;
+
     uint64_t first_sect;
     uint64_t sect_count;
 

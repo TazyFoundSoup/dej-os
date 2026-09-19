@@ -15,12 +15,6 @@
 #include <drivers/serial.h>
 #include <sys/cpu.h>
 
-enum {
-    MOUSE_MODE_OFF,
-    MOUSE_MODE_NO_MOVES,
-    MOUSE_MODE_FULL,
-};
-
 static const char qwerty_to_dvorak[128] = {
     ['q']='\'', ['w']=',', ['e']='.', ['r']='p', ['t']='y',
     ['y']='f', ['u']='g', ['i']='c', ['o']='r', ['p']='l',
@@ -157,6 +151,7 @@ int getchar_internal(uint8_t scancode, uint8_t ascii, uint32_t shift_state) {
     case 'n': return GETCHAR_CURSOR_DOWN;
     case 'b': return GETCHAR_CURSOR_LEFT;
     case 'f': return GETCHAR_CURSOR_RIGHT;
+    case 'x': return GETCHAR_F10;
     default: break;
     }
 
@@ -175,7 +170,8 @@ int getchar_internal(uint8_t scancode, uint8_t ascii, uint32_t shift_state) {
 }
 
 #if defined (BIOS)
-int _pit_sleep_and_quit_on_keypress(uint32_t ticks, uint32_t aux_poll);
+int _pit_sleep_and_quit_on_keypress(uint32_t ticks, uint32_t aux_poll,
+                                    uint64_t tsc_deadline);
 
 // XXX: sync with lib/sleep.asm_bios_ia32.
 #define PIT_SLEEP_AUX_BREAK (-100)
@@ -263,7 +259,7 @@ again:
     return ret;
 }
 
-static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
+static int sleep_ms_core(uint64_t milliseconds, bool deliver_mouse) {
     uint64_t ticks64 = milliseconds > (UINT64_MAX - 999) / 18
                      ? UINT64_MAX
                      : (milliseconds * 18 + 999) / 1000;
@@ -273,9 +269,13 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
         return 0;
     }
 
+    uint64_t tsc_deadline = rdtsc_deadline(milliseconds > UINT64_MAX / 1000
+                                         ? UINT64_MAX
+                                         : milliseconds * 1000);
+
     // Hand over mouse state accumulated while nobody was listening (e.g. a
     // pointer position preserved across a menu re-entry) before blocking.
-    if (mouse_mode == MOUSE_MODE_FULL && mouse_state_pending()) {
+    if (deliver_mouse && mouse_state_pending()) {
         return GETCHAR_MOUSE;
     }
 
@@ -284,7 +284,7 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
     bool aux_poll = mouse_present();
 
     if (!serial && !aux_poll) {
-        return _pit_sleep_and_quit_on_keypress(ticks, 0);
+        return _pit_sleep_and_quit_on_keypress(ticks, 0, tsc_deadline);
     }
 
     uint32_t start = mmind(0x46c);
@@ -293,16 +293,12 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
     for (;;) {
         uint32_t remaining = ticks - elapsed;
         int ret = _pit_sleep_and_quit_on_keypress(serial && remaining > 1 ? 1 : remaining,
-                                                  aux_poll);
+                                                  aux_poll, tsc_deadline);
 
         if (ret == PIT_SLEEP_AUX_BREAK) {
             int ev = mouse_process_pending();
-            if (mouse_mode != MOUSE_MODE_OFF && ev != 0) {
-                if (ev & (MOUSE_EVENT_BUTTON | MOUSE_EVENT_WHEEL)
-                 || mouse_mode == MOUSE_MODE_FULL) {
-                    return GETCHAR_MOUSE;
-                }
-                mouse_render_pointer();
+            if (deliver_mouse && ev != 0) {
+                return GETCHAR_MOUSE;
             }
         } else if (ret != 0) {
             return ret;
@@ -315,6 +311,10 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
             }
         }
 
+        if (rdtsc_deadline_expired(tsc_deadline)) {
+            return 0;
+        }
+
         uint32_t now = mmind(0x46c);
         elapsed = now >= start ? now - start
                 : now + (uint32_t)(BDA_TICKS_PER_DAY - start);
@@ -325,12 +325,11 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
 }
 
 int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
-    return sleep_ms_core(milliseconds, MOUSE_MODE_OFF);
+    return sleep_ms_core(milliseconds, false);
 }
 
-int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds, bool deliver_mouse_moves) {
-    return sleep_ms_core(milliseconds,
-                         deliver_mouse_moves ? MOUSE_MODE_FULL : MOUSE_MODE_NO_MOVES);
+int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds) {
+    return sleep_ms_core(milliseconds, true);
 }
 
 int pit_sleep_and_quit_on_keypress(int seconds) {
@@ -395,7 +394,7 @@ static int input_sequence(bool ext,
     return 0;
 }
 
-static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
+static int sleep_ms_core(uint64_t milliseconds, bool deliver_mouse) {
     EFI_KEY_DATA kd;
 
     UINTN which;
@@ -406,7 +405,7 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
 
     // Hand over mouse state accumulated while nobody was listening (e.g. a
     // pointer position preserved across a menu re-entry) before blocking.
-    if (mouse_mode == MOUSE_MODE_FULL && mouse_state_pending()) {
+    if (deliver_mouse && mouse_state_pending()) {
         return GETCHAR_MOUSE;
     }
 
@@ -433,7 +432,7 @@ static int sleep_ms_core(uint64_t milliseconds, int mouse_mode) {
         events[0] = exproto->WaitForKeyEx;
     }
 
-    if (mouse_mode != MOUSE_MODE_OFF) {
+    if (deliver_mouse) {
         pointer_count = mouse_get_efi_events(&events[2], 16);
     }
 
@@ -456,12 +455,8 @@ again:
     if (which >= 2) {
         int ev = mouse_handle_efi_event(which - 2);
         if (ev != 0) {
-            if (ev & (MOUSE_EVENT_BUTTON | MOUSE_EVENT_WHEEL)
-             || mouse_mode == MOUSE_MODE_FULL) {
-                gBS->CloseEvent(events[1]);
-                return GETCHAR_MOUSE;
-            }
-            mouse_render_pointer();
+            gBS->CloseEvent(events[1]);
+            return GETCHAR_MOUSE;
         }
         goto again;
     }
@@ -531,12 +526,11 @@ again:
 }
 
 int pit_sleep_ms_and_quit_on_keypress(uint64_t milliseconds) {
-    return sleep_ms_core(milliseconds, MOUSE_MODE_OFF);
+    return sleep_ms_core(milliseconds, false);
 }
 
-int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds, bool deliver_mouse_moves) {
-    return sleep_ms_core(milliseconds,
-                         deliver_mouse_moves ? MOUSE_MODE_FULL : MOUSE_MODE_NO_MOVES);
+int pit_sleep_ms_and_quit_on_input(uint64_t milliseconds) {
+    return sleep_ms_core(milliseconds, true);
 }
 
 int pit_sleep_and_quit_on_keypress(int seconds) {

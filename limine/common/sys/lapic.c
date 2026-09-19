@@ -22,6 +22,38 @@
 
 static uint32_t pending_lint0 = UINT32_MAX; // no override
 static uint32_t pending_lint1 = UINT32_MAX; // no override
+static bool pending_lint0_is_x2apic = false;
+static bool pending_lint1_is_x2apic = false;
+
+// A processor given both NMI structures is one CPU, and the x2APIC one is what
+// describes it, as for the processor entries themselves.
+static void lapic_set_pending_lint(uint8_t lint, uint32_t lvt, bool is_x2apic) {
+    uint32_t *pending;
+    bool *pending_is_x2apic;
+
+    switch (lint) {
+        case 0: {
+            pending = &pending_lint0;
+            pending_is_x2apic = &pending_lint0_is_x2apic;
+            break;
+        }
+        case 1: {
+            pending = &pending_lint1;
+            pending_is_x2apic = &pending_lint1_is_x2apic;
+            break;
+        }
+        default: {
+            return;
+        }
+    }
+
+    if (*pending_is_x2apic && !is_x2apic) {
+        return;
+    }
+
+    *pending = lvt;
+    *pending_is_x2apic = is_x2apic;
+}
 
 static uint32_t lapic_madt_nmi_flags_to_lvt(uint16_t flags) {
     uint32_t lvt = 0x10400; // masked + NMI delivery mode
@@ -43,9 +75,17 @@ static uint32_t lapic_madt_nmi_flags_to_lvt(uint16_t flags) {
     return lvt;
 }
 
-void lapic_prep_lint(struct madt *madt, uint32_t acpi_uid, bool x2apic) {
+void lapic_prep_lint(struct madt *madt, uint32_t acpi_uid) {
     pending_lint0 = UINT32_MAX; // no override
     pending_lint1 = UINT32_MAX; // no override
+    pending_lint0_is_x2apic = false;
+    pending_lint1_is_x2apic = false;
+
+    // The overrides are per-CPU and these are file statics: a caller with no
+    // entry to apply still needs the previous CPU's values cleared.
+    if (madt == NULL) {
+        return;
+    }
 
     // Walk MADT entries looking for NMI entries
     for (uint8_t *madt_ptr = (uint8_t *)madt->madt_entries_begin;
@@ -70,19 +110,15 @@ void lapic_prep_lint(struct madt *madt, uint32_t acpi_uid, bool x2apic) {
                     continue;
                 }
 
-                uint32_t lvt = lapic_madt_nmi_flags_to_lvt(nmi->flags);
-                if (nmi->lint == 0) {
-                    pending_lint0 = lvt;
-                } else if (nmi->lint == 1) {
-                    pending_lint1 = lvt;
-                }
+                lapic_set_pending_lint(nmi->lint,
+                                       lapic_madt_nmi_flags_to_lvt(nmi->flags),
+                                       false);
                 continue;
             }
             case 0x0a: {
-                // Local x2APIC NMI
-                if (!x2apic) {
-                    continue;
-                }
+                // Local x2APIC NMI. Applied whatever mode the APIC is in: a
+                // UID above 0xfe fits in no Local APIC NMI structure, so this
+                // is the only one that can name such a processor.
                 if (*(madt_ptr + 1) < sizeof(struct madt_x2apic_nmi)) {
                     continue;
                 }
@@ -94,12 +130,9 @@ void lapic_prep_lint(struct madt *madt, uint32_t acpi_uid, bool x2apic) {
                     continue;
                 }
 
-                uint32_t lvt = lapic_madt_nmi_flags_to_lvt(nmi->flags);
-                if (nmi->lint == 0) {
-                    pending_lint0 = lvt;
-                } else if (nmi->lint == 1) {
-                    pending_lint1 = lvt;
-                }
+                lapic_set_pending_lint(nmi->lint,
+                                       lapic_madt_nmi_flags_to_lvt(nmi->flags),
+                                       true);
                 continue;
             }
         }
@@ -208,11 +241,6 @@ void lapic_configure_handoff_state(void) {
 }
 
 void lapic_configure_bsp(void) {
-    struct madt *madt = acpi_get_table("APIC", 0);
-    if (madt == NULL) {
-        return;
-    }
-
     // Detect x2APIC from MSR
     bool is_x2 = !!(rdmsr(0x1b) & (1 << 10));
 
@@ -224,7 +252,13 @@ void lapic_configure_bsp(void) {
         bsp_lapic_id = lapic_read(LAPIC_REG_ID) >> 24;
     }
 
+    struct madt *madt = acpi_get_table("APIC", 0);
     uint32_t bsp_acpi_uid = 0;
+    bool found = false;
+
+    if (madt == NULL) {
+        goto done;
+    }
 
     for (uint8_t *madt_ptr = (uint8_t *)madt->madt_entries_begin;
       (uintptr_t)madt_ptr + 1 < (uintptr_t)madt + madt->header.length;
@@ -239,31 +273,37 @@ void lapic_configure_bsp(void) {
                     continue;
                 }
                 struct madt_lapic *lapic = (void *)madt_ptr;
-                if (lapic->lapic_id == bsp_lapic_id) {
+                // As in init_smp(), an x2APIC entry carrying the same ID is
+                // what describes the CPU, so the walk goes on looking for one.
+                if (lapic->lapic_id == bsp_lapic_id && !found) {
                     bsp_acpi_uid = lapic->acpi_processor_uid;
-                    goto found;
+                    found = true;
                 }
                 continue;
             }
             case 9: {
-                if (!is_x2) {
-                    continue;
-                }
+                // The BSP's ID reads back 8 bits wide in xAPIC mode, and an
+                // x2APIC entry can still be the only one carrying it: the two
+                // agree below 0xff. Intel SDM 325462-092, 13.12.8.1.
                 if (*(madt_ptr + 1) < sizeof(struct madt_x2apic)) {
                     continue;
                 }
                 struct madt_x2apic *x2lapic = (void *)madt_ptr;
                 if (x2lapic->x2apic_id == bsp_lapic_id) {
                     bsp_acpi_uid = x2lapic->acpi_processor_uid;
-                    goto found;
+                    found = true;
+                    goto done;
                 }
                 continue;
             }
         }
     }
 
-found:
-    lapic_prep_lint(madt, bsp_acpi_uid, is_x2);
+done:
+    // The MADT-derived overrides are optional. The handoff state is not: it
+    // needs no ACPI data and the protocol promises it unconditionally.
+    // A UID no entry can carry still picks up the all-processor overrides.
+    lapic_prep_lint(madt, found ? bsp_acpi_uid : 0xffffffff);
     lapic_configure_handoff_state();
 }
 
@@ -410,6 +450,12 @@ uint64_t x2apic_read(uint32_t reg) {
 }
 
 void x2apic_write(uint32_t reg, uint64_t data) {
+    // WRMSR to an x2APIC register is not serializing and may complete before
+    // preceding stores are globally visible. MFENCE does not order the WRMSR
+    // itself, hence the LFENCE.
+    // Intel SDM 325462-092, 13.12.3; AMD APM 40332 rev 4.10, 16.11.2.
+    asm volatile ("mfence; lfence" ::: "memory");
+
     wrmsr(0x800 + (reg >> 4), data);
 }
 
@@ -459,7 +505,16 @@ void init_io_apics(void) {
             case 1: {
                 if (*(madt_ptr + 1) < sizeof(struct madt_io_apic))
                     continue;
-                io_apics[max_io_apics++] = (void *)madt_ptr;
+
+                struct madt_io_apic *io_apic = (void *)madt_ptr;
+
+                // A zeroed address is an unfilled MADT field, not an I/O APIC:
+                // probing it would put the register window at physical zero.
+                if (io_apic->address == 0) {
+                    continue;
+                }
+
+                io_apics[max_io_apics++] = io_apic;
                 continue;
             }
         }
@@ -485,8 +540,41 @@ uint32_t io_apic_gsi_count(size_t io_apic) {
     return ((io_apic_read(io_apic, 1) & 0xff0000) >> 16) + 1;
 }
 
+// Firmware is known to list I/O APICs that are not actually there. Nothing
+// claims their MMIO window, so their ID, VER and ARB registers read back as
+// all ones.
+static bool io_apic_is_absent(size_t io_apic) {
+    return io_apic_read(io_apic, 0) == 0xffffffff
+        && io_apic_read(io_apic, 1) == 0xffffffff
+        && io_apic_read(io_apic, 2) == 0xffffffff;
+}
+
+// Remote IRR latches when the I/O APIC accepts a level interrupt on a pin and
+// clears on the matching EOI. One left set by an interrupt the firmware never
+// acknowledged blocks its pin: nothing more is delivered from it.
+static void io_apic_clear_remote_irr(size_t io_apic, uintptr_t ioredtbl,
+                                     uint32_t entry) {
+    // An EOI only releases the latch while the entry reads as level triggered.
+    io_apic_write(io_apic, ioredtbl, entry | (1 << 15));
+
+    if ((io_apic_read(io_apic, 1) & 0xff) >= 0x20) {
+        // The EOI register of a version 0x20 or later I/O APIC has a fixed
+        // offset of its own rather than sitting behind the index/data pair.
+        mmoutd((uintptr_t)io_apics[io_apic]->address + 0x40, entry & 0xff);
+    } else {
+        // Without one, dropping the entry to edge is what releases the latch.
+        io_apic_write(io_apic, ioredtbl, entry & ~(1 << 15));
+    }
+
+    io_apic_write(io_apic, ioredtbl, entry);
+}
+
 void io_apic_mask_all(bool mask_nmi_and_extint) {
     for (size_t i = 0; i < max_io_apics; i++) {
+        if (io_apic_is_absent(i)) {
+            continue;
+        }
+
         uint32_t gsi_count = io_apic_gsi_count(i);
         for (uint32_t j = 0; j < gsi_count; j++) {
             uintptr_t ioredtbl = j * 2 + 16;
@@ -505,6 +593,14 @@ void io_apic_mask_all(bool mask_nmi_and_extint) {
             }
 
             io_apic_write(i, ioredtbl, io_apic_read(i, ioredtbl) | (1 << 16));
+
+            // A posted write leaves the pin live for as long as it is in
+            // flight, and the kernel is entered shortly after this.
+            uint32_t entry = io_apic_read(i, ioredtbl);
+
+            if (entry & (1 << 14)) {
+                io_apic_clear_remote_irr(i, ioredtbl, entry);
+            }
         }
     }
 }
