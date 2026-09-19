@@ -384,7 +384,7 @@ int ata_init(void){
 
     gpt_hp part_buf;
     if (ata_read_sector(buf.gpt_header.part_entry_lba, part_buf.raw) != 0) {
-        printf("Failed to read lba %ull ", buf.gpt_header.part_entry_lba);
+        printf("Failed to read lba %lu ", buf.gpt_header.part_entry_lba);
         return -1;
     }
 

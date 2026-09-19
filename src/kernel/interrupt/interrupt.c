@@ -115,13 +115,13 @@ void LoRegisterInterruptVector(uint8_t vector, void (*handler)(void), char * nam
 
 
     if (vectors[vector] == true){
-        printf("vector %lu used crashing", vector);
+        printf("vector %u used crashing", vector);
         panic("Vector in use ");
     }
 
     idt_set_gate(vector, handler);
 
-    printf("Interrupt vector %lu registered succesfully to %s", name);
+    printf("Interrupt vector %u registered succesfully to %s", vector, name);
 
     return;
 }
