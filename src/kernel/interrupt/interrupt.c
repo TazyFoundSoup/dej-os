@@ -4,6 +4,8 @@
 #include <dej/stdio.h>
 #include <dej/panic.h>
 
+static bool vectors[256];       // if the vector is used or sno
+
 typedef struct {
     // General-purpose registers (pushed manually by assembly)
     uint64_t rax, rcx, rdx, rbx, rbp, rsi, rdi, r8, r9, r10, r11, r12, r13, r14, r15;
@@ -45,8 +47,9 @@ void idt_set_gate(uint8_t vector, void (*handler)(void))
     idt[vector].offset_2 = (addr >> 16) & 0xFFFF;
     idt[vector].offset_3 = (addr >> 32) & 0xFFFFFFFF;
     idt[vector].zero = 0;
-}
 
+    vectors[vector] = true;
+}
 
 
 
@@ -95,4 +98,30 @@ void idt_init(void){
 
 
     x86_load_idt(&idtr);
+}
+
+
+/*
+ * LoRegisterInterruptVector: attempts to register a interrupt handler
+ * Vector: Interrupt vector requested
+ * *Handler: function pointer to le interrupt handler
+ * Name: name of function not driver
+ *
+ */
+void LoRegisterInterruptVector(uint8_t vector, void (*handler)(void), char * name){
+    if (vector <= 64) {
+        panic("Attempted register reserved interrupt vector");
+    }
+
+
+    if (vectors[vector] == true){
+        printf("vector %lu used crashing", vector);
+        panic("Vector in use ");
+    }
+
+    idt_set_gate(vector, handler);
+
+    printf("Interrupt vector %lu registered succesfully to %s", name);
+
+    return;
 }
