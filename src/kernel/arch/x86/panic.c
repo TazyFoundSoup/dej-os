@@ -66,12 +66,11 @@ _Noreturn void panic(const char * s){
     // to do yo turn off all cpus
 
 
-    serial_puts("\nPanic: ");
-    serial_puts(s);
-    serial_puts("\n");
+    printf("\nPanic: %s \n", s);
 
 
-    stack_unwind();
+
+    // stack_unwind();
 
     triple_fault(); // turn off computer
 }

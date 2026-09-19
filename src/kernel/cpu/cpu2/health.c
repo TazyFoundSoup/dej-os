@@ -22,25 +22,28 @@ _Noreturn void HealthMonitor(void){
     printf("Starting health monitoring\n");
 
     while (true){
-        if (temperature > 90) {
+        if (atomic_load(&temperature) > 90) {
             printf("High temperature temperature is at %i\n", atomic_load(&temperature) );
             health -= 10;
         }
-        else if (temperature < 20) {
+        else if (atomic_load(&temperature) < 20) {
             printf("bit chilly eh temperature is at %llu\n", atomic_load(&temperature));
             health -= 10;
         }
 
         else {
-            health += 20;
+            health += 5;
         }
 
         cpu_takebreak();
 
-        if (health < -50) {
-            panic("Doctor needed computer health dropped to extremly low levels");
+        if (health <= -50) {
+            panic("Doctor needed computer health dropped to extremly low levels \n");
         }
-        cpu_takebreak();
+
+        for (uint32_t i = 0; i < 1000000; i++) cpu_takebreak();
+
+        printf("health score is at %d \n", health);
 
 
     }
