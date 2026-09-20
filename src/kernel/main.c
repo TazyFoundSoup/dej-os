@@ -145,7 +145,7 @@ void kentry(void) {
     void * buffer = givemeapage();
     memset(buffer, 0, 4096);
     a = fat_read(f, buffer);
-    printf("fat_read returned %i \n");
+    printf("fat_read returned %i \n", a);
 
 
 
