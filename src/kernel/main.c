@@ -100,7 +100,7 @@ void kentry(void) {
     serial_init();
     InterruptInit();
     memory_init(memmap_request.response, hhdm_request.response);
-
+    setupbspcpudata();
 
     if (x86_inb(0x92) == 4) {
         serial_puts("Last system failure caused by watchdog");
@@ -158,6 +158,9 @@ void kentry(void) {
     while (((uint64_t)cpu_percpu[1]  & 0x1)) cpu_takebreak();               // wait for the temperature to start or something lol
 
     real_temp = atomic_load(&temperature);
+
+    ksil old = RaiseSil(NOTCHILL_LEVEL);
+    LowerSil(old);
 
     printf("Welcome to dej os the temperature is %llu \n", real_temp);
 

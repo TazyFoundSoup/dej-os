@@ -12,7 +12,6 @@
 #include <dej/stdio.h>
 #include <stdatomic.h>
 
-#define __HEALTH
 
 #define MSR_GS_BASE 0xC0000101
 /*

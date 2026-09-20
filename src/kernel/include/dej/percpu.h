@@ -1,6 +1,9 @@
 #pragma once
 #include <dej/cpu.h>
 #include <stdint.h>
+#include "../../memory/memory.h"
+#include <dej/string.h>
+#include <dej/msr.h>
 
 
 /*
@@ -60,3 +63,14 @@ extern DEFINE_PERCPU(uint64_t, cpu_id);
 #define MAX_CPUS 64
 
 extern uint8_t *cpu_percpu[MAX_CPUS];       // pointer to all cpus data or something
+
+
+
+#define CHILL_LEVEL 0
+#define APC_LEVEL 1
+#define DISPATCH_LEVEL 2
+#define DEVICE_LEVEL 4                  // between 3 and 20, 4 is just like default
+#define NOTCHILL_LEVEL 21
+
+
+void setupbspcpudata();

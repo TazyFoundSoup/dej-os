@@ -1,5 +1,6 @@
 // cpu.h
 #pragma once
+#include <dej/kernel.h>
 
 static inline void cpu_takebreak(void){
     __asm__ volatile ("pause" ::: "memory");
@@ -16,3 +17,9 @@ static inline void cpu_stop(void){
         __asm__ volatile ("hlt");
     }
 }
+
+typedef uint8_t ksil;
+
+
+ksil RaiseSil(ksil new);
+void LowerSil(ksil old);
