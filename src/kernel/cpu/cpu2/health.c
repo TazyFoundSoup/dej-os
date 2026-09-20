@@ -18,7 +18,7 @@ _Noreturn void HealthMonitor(void){
 
 
     printf("Health monitor waiting for the nerds\n");
-    while ((uint64_t)(cpu_percpu[1]) & 0x01) cpu_takebreak();        // we need temperature to be on to check system health
+    while (!((uint64_t)(*cpu_percpu[1]) & 0x01)) cpu_takebreak();        // we need temperature CPU to be on to check system health
     printf("Starting health monitoring\n");
 
     while (true){

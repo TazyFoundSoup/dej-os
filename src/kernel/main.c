@@ -11,6 +11,7 @@
 #include <dej/percpu.h>
 #include <dej/kernel.h>
 
+
 extern void ap_entry(struct limine_mp_info *cpu);
 
 __attribute__((section(".temperature")))
@@ -138,8 +139,14 @@ void kentry(void) {
 
     int a = ata_init();
     if (a != 0) printf("Disk init returned %i \n", a);
-    struct file_fat32 f = fat_open("boot/kernel.elf");
+    struct file_fat32 f = fat_open("test.txt");
     if (!f.first_cluster) printf("failed to open le file\n");
+
+    void * buffer = givemeapage();
+    memset(buffer, 0, 4096);
+    a = fat_read(f, buffer);
+    printf("fat_read returned %i \n");
+
 
 
     // Fetch the first framebuffer.

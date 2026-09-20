@@ -9,3 +9,4 @@ struct file_fat32  {
 
 int ata_init(void);
 struct file_fat32 fat_open(const char * path);
+int fat_read(struct file_fat32  fat, void * buffer);

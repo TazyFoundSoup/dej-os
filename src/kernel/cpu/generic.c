@@ -12,6 +12,7 @@
 #include <dej/stdio.h>
 #include <stdatomic.h>
 
+#define __HEALTH
 
 #define MSR_GS_BASE 0xC0000101
 /*
@@ -61,9 +62,11 @@ void ap_entry(struct limine_mp_info *cpu){
             temperature_entry();
             break;
         }
+#ifdef __HEALTH
         case 2:
             HealthMonitor();
             break;
+#endif
         default: cpu_stop();
     }
 

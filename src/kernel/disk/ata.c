@@ -1,6 +1,4 @@
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
+#include <dej/kernel.h>
 #include "ata.h"
 #include <dej/string.h>
 #include <x86/x86.h>
@@ -135,6 +133,7 @@ _Static_assert(sizeof(struct direntry) == 32, "Dir entry incorrect size");
 static bool inited;
 static bool _48bitlba;
 static uint64_t vol_start_lba;
+static uint64_t fat_start_lba;
 static struct bpb g_bpb;
 
 
@@ -323,6 +322,24 @@ static int next_path_component(const char **path, char *component, size_t size)
     return 1;
 }
 
+static uint64_t get_next_cluster(uint64_t cluster){
+
+    uint32_t offset = cluster * 4;
+
+       uint32_t sector = fat_start_lba + offset / g_bpb.bytes_per_sector;
+
+       uint32_t offset_in_sector =  offset % g_bpb.bytes_per_sector;
+
+       uint8_t buffer[512];
+
+       ata_read_sector(sector, buffer);
+
+       uint32_t next = *(uint32_t *)(buffer + offset_in_sector);
+
+       return next & 0x0FFFFFFF;
+}
+
+
 int ata_init(void){
     uint8_t data;
     uint8_t status;
@@ -400,6 +417,8 @@ int ata_init(void){
     if (!(bpb.raw[510] == 0x55 && bpb.raw[511] == 0xAA))  return -1;
 
     g_bpb = bpb.bp;
+
+    fat_start_lba = vol_start_lba + bpb.bp.reserved_sectors;
 
 
     inited = true;
@@ -508,4 +527,48 @@ struct file_fat32 fat_open(const char * path){
 
 
     return ret;
+}
+
+/*
+ * fat read -
+ * - reads file into buffer
+ * args:
+ * 1 fat file returned from fat open
+ * 2  buffer to store the file
+ * 3 size for size to read (of your buffer if it the file is smaller it will just stop)
+ *
+ */
+int fat_read(struct file_fat32  fat, void * buffer){
+    if (fat.size < 1) return 0;
+    if (fat.first_cluster < 2) return EINVAL;
+    if (!inited) return ENXIO;
+
+    uint32_t SectorsToRead = (uint16_t)((fat.size + 511) / 512);
+
+    uint64_t cluster = fat.first_cluster;
+    uint64_t offset = 0;
+    uint64_t lba = 0;
+    while (cluster < 0x0FFFFFF8) {
+        lba = clustertolba48(cluster, vol_start_lba, g_bpb.reserved_sectors, g_bpb.num_fats, g_bpb.sec_per_fat, g_bpb.sectors_per_cluster);
+
+        for (int i = 0; i < g_bpb.sectors_per_cluster; i++){
+            ata_read_sector(lba + i, (char *)(buffer + (offset * 512)));
+            SectorsToRead--;
+            offset++;
+             if (SectorsToRead == 0) {
+                 goto end;
+             }
+        }
+
+        cluster = get_next_cluster(cluster);
+
+
+
+    }
+
+
+
+
+end:
+    return 0;
 }
