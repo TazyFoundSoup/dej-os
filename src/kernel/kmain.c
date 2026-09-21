@@ -29,5 +29,8 @@ _Noreturn void kmain(void){
     }
 
 
+
+    while (true)
     cpu_stop();
+
 }

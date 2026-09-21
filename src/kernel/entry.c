@@ -120,7 +120,10 @@ void kentry(void) {
     ata_init();
     check_watchdog();
 
-    printf("kentry\n");
+    printf("framebuffer %lux%lu pitch=%lu bpp=%u\n",framebuffer_request.response->framebuffers[0]->height,
+        framebuffer_request.response->framebuffers[0]->width,
+        framebuffer_request.response->framebuffers[0]->pitch,
+        framebuffer_request.response->framebuffers[0]->bpp);
 
 
 
