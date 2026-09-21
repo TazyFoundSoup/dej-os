@@ -66,11 +66,4 @@ extern uint8_t *cpu_percpu[MAX_CPUS];       // pointer to all cpus data or somet
 
 
 
-#define CHILL_LEVEL 0
-#define APC_LEVEL 1
-#define DISPATCH_LEVEL 2
-#define DEVICE_LEVEL 4                  // between 3 and 20, 4 is just like default
-#define NOTCHILL_LEVEL 21
-
-
 void setupbspcpudata();
