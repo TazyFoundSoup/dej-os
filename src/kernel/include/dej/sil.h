@@ -15,7 +15,7 @@ void LowerSil(ksil new);
 #define CHILL_LEVEL 0
 #define APC_LEVEL 1
 #define DISPATCH_LEVEL 2
-#define DEVICE_LEVEL 4                  // between 3 and 20, 4 is just like default
+#define DEVICE_LEVEL 4                  // between 3 and 15, 4 is just like default
 #define NOTCHILL_LEVEL 15           // max i would go higher if le cpu let me
 
 
