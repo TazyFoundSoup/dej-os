@@ -12,7 +12,7 @@
 #include <dej/kernel.h>
 #include <dej/sil.h>
 
-
+extern _Noreturn void kmain(void);
 extern void ap_entry(struct limine_mp_info *cpu);
 
 __attribute__((section(".temperature")))
@@ -21,26 +21,26 @@ _Atomic uint64_t temperature;
 
 // limine stuff (6 is latest revision)
 __attribute__((used, section(".limine_requests")))
-static volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
+volatile uint64_t limine_base_revision[] = LIMINE_BASE_REVISION(6);
 
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_framebuffer_request framebuffer_request = {
+volatile struct limine_framebuffer_request framebuffer_request = {
     .id = LIMINE_FRAMEBUFFER_REQUEST_ID,
     .revision = 0
 };
 
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_memmap_request memmap_request = {
+volatile struct limine_memmap_request memmap_request = {
     .id = LIMINE_MEMMAP_REQUEST_ID,
     .revision = 0
 };
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_hhdm_request hhdm_request = {
+volatile struct limine_hhdm_request hhdm_request = {
     .id = LIMINE_HHDM_REQUEST_ID,
     .revision = 0
 };
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_mp_request mp_request = {
+volatile struct limine_mp_request mp_request = {
     .id = LIMINE_MP_REQUEST_ID,
     .revision = 0
 };
@@ -66,6 +66,21 @@ void serial_init(void)
     x86_outb(0x3F8 + 4, 0x0B); // IRQs enabled, RTS/DSR
 }
 
+static inline void check_watchdog() {
+    if (x86_inb(0x92) == 4) {
+        serial_puts("Last system failure caused by watchdog");
+        __asm__ volatile (
+            "in $0x92, %%al\n\t"
+            "and $0xfb, %%al\n\t"
+            "out %%al, $0x92"
+            :
+            :
+            : "al"
+        );
+
+
+    }
+}
 
 void kentry(void) {
     if (atomic_exchange(&kentry_ran, true)) panic("kentry ran twice");
@@ -102,20 +117,8 @@ void kentry(void) {
     InterruptInit();
     memory_init(memmap_request.response, hhdm_request.response);
     setupbspcpudata();
-
-    if (x86_inb(0x92) == 4) {
-        serial_puts("Last system failure caused by watchdog");
-        __asm__ volatile (
-            "in $0x92, %%al\n\t"
-            "and $0xfb, %%al\n\t"
-            "out %%al, $0x92"
-            :
-            :
-            : "al"
-        );
-
-
-    }
+    ata_init();
+    check_watchdog();
 
     printf("kentry\n");
 
@@ -138,53 +141,12 @@ void kentry(void) {
         }
     }
 
-    int a = ata_init();
-    if (a != 0) printf("Disk init returned %i \n", a);
-    struct file_fat32 f = fat_open("test.txt");
-    if (!f.first_cluster) printf("failed to open le file\n");
-
-    void * buffer = givemeapage();
-    memset(buffer, 0, 4096);
-    a = fat_read(f, buffer);
-    printf("fat_read returned %i \n", a);
-
-
-
-    // Fetch the first framebuffer.
-    struct limine_framebuffer *framebuffer = framebuffer_request.response->framebuffers[0];
-    volatile uint32_t *fb_ptr = framebuffer->address;
-
-    size_t frame = 0;
-    uint64_t real_temp = 0;
-    while (((uint64_t)cpu_percpu[1]  & 0x1)) cpu_takebreak();               // wait for the temperature to start or something lol
-
-    real_temp = atomic_load(&temperature);
-
-    ksil old = RaiseSil(NOTCHILL_LEVEL);
-    LowerSil(old);
-
-    printf("Welcome to dej os the temperature is %llu \n", real_temp);
-
-    while (1) {
-        for (size_t y = 0; y < framebuffer->height; y++) {
-            for (size_t x = 0; x < framebuffer->width; x++) {
-
-                uint32_t red = 256;
-                uint32_t green = (y + frame) % 256;
-                uint32_t blue =   (x + frame) % 256;
-                fb_ptr[y * (framebuffer->pitch / 4) + x] =
-                    (red << 16) | (green << 8) | blue;
-            }
-        }
-        for (int i = 0; i < 100; i++) cpu_takebreak();
-        frame++;
-    }
 
 
 
 
 
-
+    kmain();
 
 
     cpu_stop(); // yo dont forget

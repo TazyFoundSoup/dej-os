@@ -26,7 +26,7 @@ all: always image
 kernel: $(KERNEL)
 
 
-$(KERNEL): $(C_OBJECTS) $(ASM_OBJECTS) $(KERNEL_DIR)/main.c $(KERNEL_DIR)/linker.ld
+$(KERNEL): $(C_OBJECTS) $(ASM_OBJECTS) $(KERNEL_DIR)/linker.ld
 	$(LD) -T $(KERNEL_DIR)/linker.ld -o $@ $(C_OBJECTS) $(ASM_OBJECTS)
 
 $(BUILD_DIR)/%.o: $(KERNEL_DIR)/%.c
