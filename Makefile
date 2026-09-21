@@ -72,12 +72,12 @@ run: image
 
 always:
 	mkdir -p build/arch/x86
-	mkdir -p build/keyboard
+	mkdir -p build/drivers/keyboard
 	mkdir -p build/interrupt
 	mkdir -p build/memory
 	mkdir -p build/x86/
 	mkdir -p build/cpu/cpu1/
-	mkdir -p build/disk
+	mkdir -p build/drivers/disk
 	mkdir -p build/include/dej
 	mkdir -p build/cpu/cpu2
 

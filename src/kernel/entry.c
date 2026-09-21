@@ -7,7 +7,7 @@
 #include <dej/panic.h>
 #include <dej/msr.h>
 #include <dej/cpu.h>
-#include "disk/ata.h"
+#include <dej/ata.h>
 #include <dej/percpu.h>
 #include <dej/kernel.h>
 #include <dej/sil.h>

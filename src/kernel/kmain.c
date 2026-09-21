@@ -29,7 +29,5 @@ _Noreturn void kmain(void){
     }
 
 
-
     cpu_stop();
-
 }
