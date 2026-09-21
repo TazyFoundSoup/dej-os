@@ -10,6 +10,7 @@
 #include "disk/ata.h"
 #include <dej/percpu.h>
 #include <dej/kernel.h>
+#include <dej/sil.h>
 
 
 extern void ap_entry(struct limine_mp_info *cpu);

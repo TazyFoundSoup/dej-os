@@ -1,10 +1,12 @@
 #include <dej/stdio.h>
 #include <x86/x86.h>
 #include <dej/cpu.h>
-
+#include <dej/sil.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 
+
+// just kinda dumps stuff in the serial no locks or shit
 #define puts(x) serial_puts(x)
 void serial_puts(const char *s) {
     while (*s) {
@@ -110,6 +112,7 @@ void printf_signed(long long number, int radix)
 #define PRINTF_LENGTH_LONG_LONG     4
 void printf(const char* fmt, ...)
 {
+    Assert_sil_chill();
     while (atomic_flag_test_and_set_explicit(&serial_lock, memory_order_acquire)) {
             // wait for lock bro
             cpu_takebreak();
@@ -254,5 +257,3 @@ void printf(const char* fmt, ...)
 
     atomic_flag_clear_explicit(&serial_lock, memory_order_release);
 }
-
-

@@ -17,9 +17,3 @@ static inline void cpu_stop(void){
         __asm__ volatile ("hlt");
     }
 }
-
-typedef uint8_t ksil;
-
-
-ksil RaiseSil(ksil new);
-void LowerSil(ksil old);

@@ -4,6 +4,7 @@
 #include <x86/x86.h>
 #include <dej/stdio.h>
 #include "../memory/memory.h"
+#include <dej/sil.h>
 
 
 // io ports
@@ -341,6 +342,8 @@ static uint64_t get_next_cluster(uint64_t cluster){
 
 
 int ata_init(void){
+    Assert_sil_chill();
+
     uint8_t data;
     uint8_t status;
     uint32_t tries = 0;
@@ -440,6 +443,7 @@ timeout:
  * 0 for good
  */
 static int findfat_file(const char * fname, struct direntry *out, uint32_t dir_cluster){
+    Assert_sil_chill();
     if (!inited) return -1;
     if (strnlen(fname, 12) == 12) return -1;
     void * cluster = givemeapage();
@@ -504,6 +508,7 @@ Found:
 }
 
 struct file_fat32 fat_open(const char * path){
+    Assert_sil_chill();
     struct file_fat32 ret = {0};
     struct direntry dirent = {0};
     char component[256];
@@ -539,6 +544,7 @@ struct file_fat32 fat_open(const char * path){
  *
  */
 int fat_read(struct file_fat32  fat, void * buffer){
+    Assert_sil_chill();
     if (fat.size < 1) return 0;
     if (fat.first_cluster < 2) return EINVAL;
     if (!inited) return ENXIO;

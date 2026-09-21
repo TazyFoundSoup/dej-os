@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "keyboard.h"
 #include <dej/cpu.h>
+#include <dej/sil.h>
 
 #define waittosend while (x86_inb(0x64) & 0x02) \
     cpu_takebreak();
@@ -39,6 +40,9 @@ uint8_t keyd = 0;
 // 0 = all good
 // 1 = keyboard failed its own test
 int keyboard_init(void){
+
+    Assert_sil_chill();
+
     int attempts = 0;
     uint8_t response = 0;
     // send 0xFF for keyboard turn on
@@ -151,6 +155,7 @@ int keyboard_init(void){
 // -1 = initilise the keyboard
 key_t keyboard_poll_k(){
     if (!inited) return -1;
+    Assert_sil_chill();
     uint8_t response;
 
 start:
