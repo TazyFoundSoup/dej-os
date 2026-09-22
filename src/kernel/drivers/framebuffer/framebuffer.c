@@ -8,6 +8,11 @@ void framebuffer_init(){
 
 }
 
+/*
+ * tuffest function ever
+ * allowed at all irql lol
+ *
+ */
 void putpixel(uint64_t x, uint64_t y, uint32_t colour){
     fb_ptr[y * (framebuffer->pitch / 4) + x] = colour;
 }
