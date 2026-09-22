@@ -16,3 +16,12 @@ void framebuffer_init(){
 void putpixel(uint64_t x, uint64_t y, uint32_t colour){
     fb_ptr[y * (framebuffer->pitch / 4) + x] = colour;
 }
+
+
+void clearscreen(void){
+    for (uint32_t x = 0; x < framebuffer->width; x++){
+        for (uint32_t y = 0; y < framebuffer->height; y++){
+            putpixel(x, y, 0x0);
+        }
+    }
+}

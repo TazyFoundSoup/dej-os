@@ -25,6 +25,9 @@ _Noreturn void kmain(void){
         y++;
     }
 
+    cpu_takebreak();
+
+    clearscreen();
 
     cpu_stop();
 }
