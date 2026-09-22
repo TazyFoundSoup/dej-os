@@ -78,6 +78,7 @@ always:
 	mkdir -p build/x86/
 	mkdir -p build/cpu/cpu1/
 	mkdir -p build/drivers/disk
+	mkdir -p build/drivers/framebuffer
 	mkdir -p build/include/dej
 	mkdir -p build/cpu/cpu2
 
